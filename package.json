@@ -19,7 +19,7 @@
     "desktop:prepare": "node scripts/prepare-desktop.mjs",
     "desktop:dist": "pnpm build && pnpm desktop:prepare && electron-builder --config electron-builder.yml",
     "desktop:dist:win": "pnpm build && pnpm desktop:prepare && electron-builder --config electron-builder.yml --win",
-    "desktop:dist:mac": "pnpm build && pnpm desktop:prepare && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --config electron-builder.yml --mac"
+    "desktop:dist:mac": "pnpm build && pnpm desktop:prepare && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --config electron-builder.yml --mac --publish never"
   },
   "dependencies": {
     "pinia": "^4.0.3",
