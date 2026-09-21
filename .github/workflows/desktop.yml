@@ -1,0 +1,96 @@
+# Windows + macOS 云端打包（无需本地对应系统）
+name: Build Desktop
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Build frontend + stage runtime
+        env:
+          DEPLOYX_NODE_PLATFORM: win32
+          DEPLOYX_NODE_ARCH: x64
+        run: pnpm build && pnpm desktop:prepare
+
+      - name: Package Windows app
+        run: pnpm exec electron-builder --config electron-builder.yml --win --x64 --publish never
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v5
+        with:
+          name: DeployX-windows-x64
+          path: |
+            release/DeployX-Setup-*.exe
+            release/DeployX-Portable-*.exe
+          if-no-files-found: error
+
+  mac:
+    name: macOS ${{ matrix.arch }}
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        # 都在 macos-14（Apple Silicon）上打：arm64 原生，x64 交叉编译
+        # 不再使用 macos-13，避免排队等不到 runner
+        arch: [arm64, x64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Build frontend + stage runtime
+        env:
+          DEPLOYX_NODE_PLATFORM: darwin
+          DEPLOYX_NODE_ARCH: ${{ matrix.arch }}
+        run: pnpm build && pnpm desktop:prepare
+
+      - name: Package macOS app
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: pnpm exec electron-builder --config electron-builder.yml --mac --${{ matrix.arch }} --publish never
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v5
+        with:
+          name: DeployX-mac-${{ matrix.arch }}
+          path: |
+            release/*.dmg
+            release/*.zip
+          if-no-files-found: error

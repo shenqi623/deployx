@@ -18,29 +18,24 @@
 
 面向不熟悉命令行的用户，可打包成 **安装包** 与 **绿色版**（内置 Node，无需本机安装 Node）。
 
-### Windows（本机）
+### Windows / macOS（推荐：GitHub Actions）
+
+打开仓库 → **Actions** → **Build Desktop** → **Run workflow**。
+
+跑完后在 **Summary → Artifacts** 下载：
+
+| 文件 | 给谁用 |
+|------|--------|
+| `DeployX-windows-x64` | Windows（Setup / Portable） |
+| `DeployX-mac-arm64` | Apple Silicon（M1/M2/M3） |
+| `DeployX-mac-x64` | Intel Mac |
+
+本机也可分别打包：
 
 ```sh
-pnpm install
-pnpm desktop:dist:win
+pnpm desktop:dist:win   # Windows
+pnpm desktop:dist:mac   # 仅在 Mac 上
 ```
-
-产物在 `release/`：
-
-- `DeployX-Setup-*.exe`：安装版
-- `DeployX-Portable-*.exe`：绿色版
-
-### macOS（没有 Mac 时用 GitHub Actions）
-
-Windows 无法直接打出可用的 Mac 安装包。请把代码推到 GitHub 后：
-
-1. 打开仓库 → **Actions** → **Build macOS**
-2. 点 **Run workflow**
-3. 跑完后在该次运行的 **Artifacts** 下载：
-   - `DeployX-mac-arm64`（Apple Silicon：M1/M2/M3）
-   - `DeployX-mac-x64`（Intel Mac）
-
-若你有 Mac，也可本机执行：`pnpm desktop:dist:mac`。
 
 本地先看窗口效果（需本机已有 Node）：
 
