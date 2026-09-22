@@ -7,12 +7,14 @@ import { access } from 'node:fs/promises'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const PREFERRED_PORT = Number(process.env.DEPLOYX_PORT || 4318)
+const PORT_SPAN = 40
 
 let mainWindow = null
 let apiProcess = null
 let stopping = false
 let apiBase = `http://127.0.0.1:${PREFERRED_PORT}`
 let apiLogs = ''
+let startingApi = false
 
 function isPackaged() {
   return app.isPackaged
@@ -41,30 +43,54 @@ function appendLog(chunk) {
   process.stdout.write(text)
 }
 
+function isAddrInUse(text) {
+  return /EADDRINUSE|address already in use|端口 .+ 已被占用/i.test(String(text || ''))
+}
+
 function findFreePort(startPort) {
   return new Promise((resolve, reject) => {
     const tryPort = port => {
-      if (port > startPort + 40) {
-        reject(new Error(`找不到可用端口（已尝试 ${startPort}-${startPort + 40}）`))
+      if (port > startPort + PORT_SPAN) {
+        reject(new Error('BUSY'))
         return
       }
       const server = net.createServer()
       server.unref()
       server.once('error', () => tryPort(port + 1))
-      server.listen(port, '127.0.0.1', () => {
-        server.close(() => resolve(port))
+      // exclusive：避免系统误判「端口空闲」，导致小白用户看到占用报错
+      server.listen({ port, host: '127.0.0.1', exclusive: true }, () => {
+        server.close(err => (err ? tryPort(port + 1) : resolve(port)))
       })
     }
     tryPort(startPort)
   })
 }
 
+function killChild(child) {
+  if (!child || child.killed || child.exitCode != null) return
+  try {
+    if (process.platform === 'win32') {
+      spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' })
+    } else {
+      child.kill('SIGTERM')
+      setTimeout(() => {
+        if (child.exitCode == null) child.kill('SIGKILL')
+      }, 1500).unref?.()
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
 async function waitForApi(port, child, timeoutMs = 45000) {
   const started = Date.now()
   while (Date.now() - started < timeoutMs) {
     if (!child || child.exitCode != null) {
-      const detail = apiLogs.trim() || `进程提前退出（代码 ${child?.exitCode ?? 'unknown'}）`
-      throw new Error(`本地服务未能启动。\n\n${detail}`)
+      const detail = apiLogs.trim()
+      const err = new Error(isAddrInUse(detail) ? 'EADDRINUSE' : 'EXIT')
+      err.detail = detail
+      err.code = isAddrInUse(detail) ? 'EADDRINUSE' : 'EXIT'
+      throw err
     }
     try {
       const res = await fetch(`http://127.0.0.1:${port}/api/health`)
@@ -74,62 +100,108 @@ async function waitForApi(port, child, timeoutMs = 45000) {
     }
     await sleep(250)
   }
-  const detail = apiLogs.trim()
-  throw new Error(
-    `本地服务启动超时（端口 ${port}）。\n\n` +
-      (detail || '没有捕获到服务日志。若刚关闭过 DeployX / pnpm dev，请等几秒再开，或重启电脑后再试。'),
-  )
+  const err = new Error('TIMEOUT')
+  err.code = 'TIMEOUT'
+  err.detail = apiLogs.trim()
+  throw err
 }
 
-async function startApi() {
-  apiLogs = ''
-  const root = appRoot()
-  const nodeBin = resolveNodeBinary()
-  const entry = path.join(root, 'server', 'index.mjs')
-  await access(entry)
-
-  const port = await findFreePort(PREFERRED_PORT)
-  apiBase = `http://127.0.0.1:${port}`
-
-  const dataDir = path.join(app.getPath('userData'), 'data')
+function spawnApi(nodeBin, entry, root, port, dataDir) {
   const env = {
     ...process.env,
     PORT: String(port),
     DEPLOYX_DATA_DIR: dataDir,
     NODE_USE_ENV_PROXY: '1',
   }
-
-  apiProcess = spawn(nodeBin, [entry], {
+  const child = spawn(nodeBin, [entry], {
     cwd: root,
     env,
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
   })
+  child.stdout?.on('data', appendLog)
+  child.stderr?.on('data', appendLog)
+  child.on('error', error => appendLog(`启动失败：${error.message}\n`))
+  return child
+}
 
-  apiProcess.stdout?.on('data', appendLog)
-  apiProcess.stderr?.on('data', appendLog)
-  apiProcess.on('error', error => appendLog(`启动失败：${error.message}\n`))
-  apiProcess.on('exit', code => {
-    const proc = apiProcess
-    apiProcess = null
-    if (!stopping && mainWindow && !mainWindow.isDestroyed()) {
-      dialog.showErrorBox('DeployX', `本地服务已退出（代码 ${code ?? 'unknown'}）。\n\n${apiLogs.trim() || '无更多日志'}`)
+async function startApi() {
+  if (apiProcess && apiProcess.exitCode == null) return
+  startingApi = true
+  apiLogs = ''
+  const root = appRoot()
+  const nodeBin = resolveNodeBinary()
+  const entry = path.join(root, 'server', 'index.mjs')
+  await access(entry)
+
+  const dataDir = path.join(app.getPath('userData'), 'data')
+  let nextPort = PREFERRED_PORT
+  let lastError = null
+
+  try {
+    for (let attempt = 0; attempt <= PORT_SPAN; attempt++) {
+      let port
+      try {
+        port = await findFreePort(nextPort)
+      } catch {
+        break
+      }
+
+      apiLogs = ''
+      apiBase = `http://127.0.0.1:${port}`
+      const child = spawnApi(nodeBin, entry, root, port, dataDir)
+      apiProcess = child
+
+      const onExit = code => {
+        if (apiProcess !== child) return
+        apiProcess = null
+        if (!stopping && !startingApi && mainWindow && !mainWindow.isDestroyed()) {
+          dialog.showErrorBox(
+            'DeployX',
+            '本地服务意外退出。请重新打开 DeployX；若仍不行，可先完全退出后再开，或重启电脑。',
+          )
+          void code
+        }
+      }
+      child.on('exit', onExit)
+
+      try {
+        await waitForApi(port, child)
+        child.removeListener('exit', onExit)
+        child.on('exit', onExit)
+        return
+      } catch (error) {
+        lastError = error
+        child.removeListener('exit', onExit)
+        if (apiProcess === child) apiProcess = null
+        killChild(child)
+        await sleep(150)
+
+        if (error?.code === 'EADDRINUSE') {
+          nextPort = port + 1
+          continue
+        }
+        break
+      }
     }
-    void proc
-  })
 
-  await waitForApi(port, apiProcess)
+    const friendly =
+      lastError?.code === 'EADDRINUSE' || lastError?.message === 'BUSY'
+        ? '无法启动 DeployX：本机临时通道都被占用了。\n\n请完全退出所有 DeployX 窗口后重试；仍不行请重启电脑后再打开。'
+        : lastError?.code === 'TIMEOUT'
+          ? '启动超时。请再试一次；若刚关闭过 DeployX，请稍等几秒后再开。'
+          : '无法启动本地服务。请重新打开 DeployX；仍不行请重启电脑后再试。'
+    throw new Error(friendly)
+  } finally {
+    startingApi = false
+  }
 }
 
 function stopApi() {
   stopping = true
-  if (!apiProcess || apiProcess.killed) return
-  if (process.platform === 'win32') {
-    spawn('taskkill', ['/pid', String(apiProcess.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' })
-  } else {
-    apiProcess.kill('SIGTERM')
-  }
+  const child = apiProcess
   apiProcess = null
+  killChild(child)
 }
 
 async function createWindow() {

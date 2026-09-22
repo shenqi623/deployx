@@ -148,5 +148,12 @@ const server = http.createServer(async (req, res) => {
     catch { if(!res.headersSent)res.writeHead(404); res.end('请先运行 pnpm build，或使用 pnpm dev 启动开发界面。') }
   } catch(e) { if(!res.headersSent)json(res,400,{error:redact(e.message)}); else res.end() }
 })
+server.on('error', err => {
+  if (err && err.code === 'EADDRINUSE') {
+    console.error(`端口 ${port} 已被占用。请关闭其他 DeployX / pnpm start / pnpm dev，或设置环境变量 PORT 换端口后重试。`)
+    process.exit(1)
+  }
+  throw err
+})
 server.listen(port,'127.0.0.1',()=>console.log(`DeployX local API: http://127.0.0.1:${port}`))
 setInterval(()=>{for(const [id,s]of connections)if(s.expires<Date.now())connections.delete(id);for(const[id,p]of plans)if(p.expires<Date.now())plans.delete(id)},60000).unref()
