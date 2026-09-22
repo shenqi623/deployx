@@ -147,6 +147,18 @@ const overviewModeLabel = computed(() => config.mode === 'node'
   ? '动态网站（Node + Nginx 反向代理）'
   : '静态网站（Nginx 直接托管）')
 const step = ref(0), online = ref(false), busy = ref(''), error = ref(''), notice = ref('')
+let errorTimer: ReturnType<typeof setTimeout> | undefined
+let noticeTimer: ReturnType<typeof setTimeout> | undefined
+watch(error, value => {
+  clearTimeout(errorTimer)
+  if (!value) return
+  errorTimer = setTimeout(() => { error.value = '' }, 2500)
+})
+watch(notice, value => {
+  clearTimeout(noticeTimer)
+  if (!value) return
+  noticeTimer = setTimeout(() => { notice.value = '' }, 2500)
+})
 const stepHelp = computed(() => ([
   { title: '这一步做什么？', body: '把「本地项目」告诉 DeployX。优先点「识别项目」，它会自动选好静态或动态、产物目录；你也可以对照下方指南自己勾选。' },
   { title: '这一步做什么？', body: '连接云服务器（通常是 Ubuntu）。指纹用来确认「连的是你的那台机器」。连上后若缺 Nginx / Node / PM2，可一键安装。' },
@@ -551,11 +563,48 @@ onMounted(async()=>{
   config.syncSheet=false
   try{const h=await api<{activeJob:string|null;startedAt?:string}>('/health');online.value=true;syncServerEpoch(h.startedAt);history.value=await api<Job[]>('/history');if(h.activeJob)await openJob(h.activeJob)}catch{online.value=false}timer=setInterval(async()=>{try{const h=await api<{activeJob:string|null;startedAt?:string}>('/health');online.value=true;syncServerEpoch(h.startedAt);if(job.value?.status==='running')job.value=await api<Job>(`/jobs/${job.value.id}`);else if(h.activeJob&&!job.value)await openJob(h.activeJob);history.value=await api<Job[]>('/history')}catch{online.value=false}},2500)
 })
-onUnmounted(()=>clearInterval(timer))
+onUnmounted(()=>{
+  clearInterval(timer)
+  clearTimeout(errorTimer)
+  clearTimeout(noticeTimer)
+})
 </script>
 
 <template>
 <div class="shell">
+  <Teleport to="body">
+    <div class="deployx-flash" aria-live="polite">
+      <Transition name="flash-fade">
+        <el-alert
+          v-if="error"
+          type="error"
+          show-icon
+          :closable="true"
+          :title="error"
+          @close="error=''"
+        />
+      </Transition>
+      <Transition name="flash-fade">
+        <el-alert
+          v-if="notice"
+          type="success"
+          show-icon
+          :closable="true"
+          :title="notice"
+          @close="notice=''"
+        />
+      </Transition>
+      <Transition name="flash-fade">
+        <el-alert
+          v-if="!online"
+          type="warning"
+          show-icon
+          :closable="false"
+          :title="isDesktop ? '本地服务未连接，请重新打开 DeployX。' : '本地服务未连接，请确认本机服务已启动。'"
+        />
+      </Transition>
+    </div>
+  </Teleport>
   <aside class="sidebar">
     <a class="brand" href="#" @click.prevent="step=0"><span class="brand-icon">↗</span><span>DeployX<small>部署工作台</small></span></a>
     <div class="workspace-label">WORKSPACE <span>LOCAL</span></div><button class="nav-home" @click="newDeploy"><span>◈</span> 新建部署 <b>＋</b></button><div class="nav-caption">部署向导</div>
@@ -566,9 +615,6 @@ onUnmounted(()=>clearInterval(timer))
     <header class="topbar"><div>工作空间 <span>/</span> 新建部署 <span>/</span> <strong>{{steps[step]?.name}}</strong></div><div class="top-actions"><span class="local-pill">◉ 本机模式</span><button class="text-button" @click="loadDraft">恢复草稿</button><button class="button small secondary" @click="saveDraft">保存草稿</button></div></header>
     <main>
       <div class="page-heading"><div><div class="eyebrow">FROM LOCAL TO LIVE</div><h1>{{step===5?'看着网站一点点上线。':'把本地项目，部署到你的域名。'}}</h1><p>{{steps[step]?.brief}}</p></div><div class="step-counter"><strong>0{{step+1}}</strong><span>/ 06</span></div></div>
-      <div v-if="error" class="alert error" role="alert"><b>需要处理</b><span>{{error}}</span><button @click="error=''" aria-label="关闭错误">×</button></div>
-      <div v-if="notice" class="alert success" role="status"><span>{{notice}}</span><button @click="notice=''" aria-label="关闭提示">×</button></div>
-      <div v-if="!online" class="alert warning">{{ isDesktop ? '本地服务还没连上。请重新打开 DeployX；若刚关闭过，请稍等几秒再试。' : '本地服务还没连上。请确认本机 DeployX 服务已启动。' }}</div>
       <div class="content-grid">
         <section class="workspace-card">
           <div class="card-heading"><div><span class="section-index">第 {{step+1}} 步</span><h2>{{steps[step]?.name}}</h2><p>{{steps[step]?.desc}}</p></div><span class="tag">{{step===5?'进行中':'向导'}}</span></div>

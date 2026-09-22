@@ -22,6 +22,7 @@
     "desktop:dist:mac": "pnpm build && pnpm desktop:prepare && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --config electron-builder.yml --mac --publish never"
   },
   "dependencies": {
+    "element-plus": "^2.14.6",
     "pinia": "^4.0.3",
     "ssh2": "^1.17.0",
     "vue": "^3.5.42",
