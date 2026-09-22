@@ -110,7 +110,7 @@ pnpm start
 | `pnpm build` | 类型检查 + 前端构建 |
 | `pnpm start` | 仅启动本机 API（并托管 `dist`） |
 | `pnpm desktop` | 构建前端并用 Electron 打开桌面窗口 |
-| `pnpm desktop:dist` | 打包 Windows 安装包 + 绿色版到 `release/` |
+| `pnpm desktop:dist` | 打包桌面安装包到仓库同级目录 `../deployx-release/` |
 | `pnpm test` | 运行 `server/*.test.mjs` |
 | `pnpm type-check` | 仅 TypeScript / Vue 类型检查 |
 | `pnpm format` | Prettier 格式化 `src/` |
@@ -134,5 +134,6 @@ server/       本机 API：识别项目、SSH、依赖安装、构建上传、�
 scripts/      开发启动脚本
 .deployx/     本地运行数据（勿提交）
 electron/     桌面壳（Electron）
-release/      桌面安装包输出
+../deployx-release/  桌面安装包输出（仓库外，避免本机编辑器锁文件）
+release/      （旧目录，可删；已不再使用）
 ```

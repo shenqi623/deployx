@@ -4,7 +4,8 @@ copyright: Copyright © DeployX
 npmRebuild: false
 nodeGypRebuild: false
 directories:
-  output: release
+  # 放到仓库外，避免本机 Cursor 监视/打开 release 时锁住 app.asar 导致 EBUSY
+  output: ../deployx-release
   buildResources: build
 files:
   - electron/**/*

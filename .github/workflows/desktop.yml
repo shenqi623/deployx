@@ -45,8 +45,8 @@ jobs:
         with:
           name: DeployX-windows-x64
           path: |
-            release/DeployX-Setup-*.exe
-            release/DeployX-Portable-*.exe
+            ../deployx-release/DeployX-Setup-*.exe
+            ../deployx-release/DeployX-Portable-*.exe
           if-no-files-found: error
 
   mac:
@@ -91,6 +91,6 @@ jobs:
         with:
           name: DeployX-mac-${{ matrix.arch }}
           path: |
-            release/*.dmg
-            release/*.zip
+            ../deployx-release/*.dmg
+            ../deployx-release/*.zip
           if-no-files-found: error

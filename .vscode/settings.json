@@ -1,0 +1,15 @@
+{
+  "files.watcherExclude": {
+    "**/release/**": true,
+    "**/desktop-staging/**": true,
+    "**/dist/**": true
+  },
+  "search.exclude": {
+    "**/release": true,
+    "**/desktop-staging": true,
+    "**/dist": true
+  },
+  "files.exclude": {
+    "**/release/win-unpacked": true
+  }
+}
