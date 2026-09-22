@@ -3,15 +3,16 @@ import { assert } from './core.mjs'
 export const PACKAGE_IDS = ['nginx', 'node', 'pm2', 'certbot']
 
 export const PROBE_COMMAND = [
-  "printf 'SYSTEM '; uname -s",
+  "printf 'SYSTEM '; uname -s; printf '\\n'",
   "printf 'DISTRO_ID '; . /etc/os-release 2>/dev/null && printf '%s' \"$ID\" || printf unknown; printf '\\n'",
   "printf 'DISTRO_LIKE '; . /etc/os-release 2>/dev/null && printf '%s' \"$ID_LIKE\" || printf ''; printf '\\n'",
-  "printf 'NODE '; node --version 2>/dev/null || true",
-  "printf 'NGINX '; command -v nginx || true",
-  "printf 'PM2 '; command -v pm2 || true",
-  "printf 'CERTBOT '; command -v certbot || true",
-  "printf 'SUDO '; sudo -n true 2>/dev/null && echo yes || echo no",
-  "printf '\\nPORTS\\n'; ss -H -ltn 2>/dev/null || true",
+  // 每项独占一行；缺软件时也要换行，避免 NODE/NGINX/…粘成一行导致误判无 sudo
+  "printf 'NODE '; node --version 2>/dev/null || true; printf '\\n'",
+  "printf 'NGINX '; command -v nginx || true; printf '\\n'",
+  "printf 'PM2 '; command -v pm2 || true; printf '\\n'",
+  "printf 'CERTBOT '; command -v certbot || true; printf '\\n'",
+  "printf 'SUDO '; sudo -n true 2>/dev/null && printf 'yes' || printf 'no'; printf '\\n'",
+  "printf 'PORTS\\n'; ss -H -ltn 2>/dev/null || true",
 ].join('; ')
 
 function lineValue(report, key) {

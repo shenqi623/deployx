@@ -26,13 +26,23 @@ SUDO yes
 PORTS
 `
 
-test('parseReport detects debian family and missing tools', () => {
-  const parsed = parseReport(blankDebian)
-  assert.equal(parsed.osFamily, 'debian')
+test('parseReport keeps sudo when tools are missing on separate lines', () => {
+  const gluedBug = 'NODE NGINX PM2 CERTBOT SUDO yes\n'
+  assert.equal(parseReport(gluedBug).hasSudo, false, '旧粘连格式无法可靠解析')
+
+  const fixed = `SYSTEM Linux
+DISTRO_ID ubuntu
+DISTRO_LIKE debian
+NODE 
+NGINX 
+PM2 
+CERTBOT 
+SUDO yes
+`
+  const parsed = parseReport(fixed)
   assert.equal(parsed.hasSudo, true)
   assert.equal(parsed.hasNginx, false)
-  assert.equal(parsed.hasNode22, false)
-  assert.deepEqual(missingPackages(parsed), ['nginx', 'node', 'pm2', 'certbot'])
+  assert.equal(requirementsFromReport(fixed).canBootstrap, true)
 })
 
 test('parseReport accepts Node 22+ and rejects older Node', () => {

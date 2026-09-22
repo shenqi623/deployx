@@ -156,7 +156,7 @@ const stepHelp = computed(() => ([
   { title: '这一步做什么？', body: '部署进行中可看日志。失败站点可单独重试；成功的一般不用再处理。' },
 ][step.value] || { title: '提示', body: '' }))
 const project = ref<Project | null>(null), plan = ref<Plan | null>(null), job = ref<Job | null>(null), history = ref<Job[]>([])
-const config = reactive({projectPath:'',framework:'astro',mode:'static',output:'dist',entry:'',spa:false,buildTool:'auto',buildScript:'build',baseDir:'/var/www/deployx',startPort:3021,https:true,email:'',validation:'minimal',checkPaths:['/'],loadEnv:true,envText:'',requireSiteKey:true,runtimeInstall:false,runner:'static',continueOnError:true,syncSheet:false,sourceId:'',connectionId:'',sites:[] as Site[]})
+const config = reactive(createDefaultConfig())
 const server = reactive({host:'',port:22,username:'ubuntu',auth:'key',keyPath:'',passphrase:'',password:'',agent:'',fingerprint:''})
 const fingerprint = ref(''), trusted = ref(false), report = ref(''), connected = ref(false)
 const requirements = ref<Requirements | null>(null), bootstrapLog = ref('')
@@ -166,15 +166,71 @@ const acknowledge = ref(false), customPaths = ref('/\n/sitemap.xml')
 const selected = computed(()=>config.sites.filter(s=>s.selected))
 const successful = computed(()=>job.value?.results.filter(r=>r.status==='deployed').length || 0)
 const failed = computed(()=>job.value?.results.filter(r=>r.status==='failed').length || 0)
-const progress = computed(()=>job.value ? Math.round(job.value.results.length / job.value.total * 100) : 0)
+const progress = computed(() => {
+  if (!job.value || !job.value.total) return 0
+  return Math.round(job.value.results.length / job.value.total * 100)
+})
+const progressHeadline = computed(() => {
+  if (!job.value) return ''
+  if (job.value.status === 'running' && job.value.results.length === 0) return '进行中'
+  return String(progress.value)
+})
+const showProgressPercent = computed(() => !(job.value?.status === 'running' && job.value.results.length === 0))
+const lastLogAt = computed(() => {
+  const last = job.value?.logs?.at(-1)?.time
+  return last ? last.slice(11, 19) : ''
+})
+const isDesktop = computed(() => typeof window !== 'undefined' && !!(window as Window & { deployxDesktop?: { isDesktop?: boolean } }).deployxDesktop?.isDesktop)
+const pathPlaceholder = computed(() => (navigator.platform || '').toLowerCase().includes('mac')
+  ? '例如 /Users/你/Projects/my-site'
+  : '例如 D:\\Project\\Apps\\consumer')
+const keyPathPlaceholder = computed(() => (navigator.platform || '').toLowerCase().includes('mac')
+  ? '例如 /Users/你/.ssh/id_ed25519'
+  : '例如 C:\\Users\\你\\.ssh\\id_ed25519')
 const readyCount = computed(()=>[!!project.value,connected.value,selected.value.length>0,!!config.email||!config.https].filter(Boolean).length)
 const statusLabel = (s:string)=>({running:'进行中',complete:'已完成',partial:'部分失败',failed:'失败',stopped:'已停止',interrupted:'已中断',deployed:'已部署'}[s] || s)
+function createDefaultConfig() {
+  return {
+    projectPath: '',
+    framework: 'astro',
+    mode: 'static',
+    output: 'dist',
+    entry: '',
+    spa: false,
+    buildTool: 'auto',
+    buildScript: 'build',
+    baseDir: '/var/www/deployx',
+    startPort: 3021,
+    https: true,
+    email: '',
+    validation: 'minimal',
+    checkPaths: ['/'],
+    loadEnv: true,
+    envText: '',
+    requireSiteKey: true,
+    runtimeInstall: false,
+    runner: 'static',
+    continueOnError: true,
+    syncSheet: false,
+    sourceId: '',
+    connectionId: '',
+    sites: [] as Site[],
+  }
+}
 function normalizeLocalPath(value: string) {
   let path = String(value || '').trim()
   while ((path.startsWith('"') && path.endsWith('"')) || (path.startsWith("'") && path.endsWith("'"))) {
     path = path.slice(1, -1).trim()
   }
   return path
+}
+function normalizeDomain(raw: string) {
+  let domain = String(raw || '').trim().toLowerCase()
+  domain = domain.replace(/^https?:\/\//i, '')
+  domain = domain.replace(/[/?#].*$/, '')
+  domain = domain.replace(/:\d+$/, '')
+  domain = domain.replace(/\.$/, '')
+  return domain
 }
 function onProjectPathInput(e: Event) {
   config.projectPath = normalizeLocalPath((e.target as HTMLInputElement).value)
@@ -183,12 +239,38 @@ function onProjectPathInput(e: Event) {
 function onKeyPathInput(e: Event) {
   server.keyPath = normalizeLocalPath((e.target as HTMLInputElement).value)
 }
+async function pickProjectDir() {
+  const desktop = (window as Window & { deployxDesktop?: { pickDirectory: () => Promise<string | null> } }).deployxDesktop
+  if (!desktop?.pickDirectory) {
+    error.value = '当前环境不支持文件夹选择，请手动粘贴路径。'
+    return
+  }
+  const chosen = await desktop.pickDirectory()
+  if (!chosen) return
+  config.projectPath = normalizeLocalPath(chosen)
+  project.value = null
+}
+async function pickKeyFile() {
+  const desktop = (window as Window & { deployxDesktop?: { pickFile: (filters?: unknown) => Promise<string | null> } }).deployxDesktop
+  if (!desktop?.pickFile) {
+    error.value = '当前环境不支持文件选择，请手动粘贴私钥路径。'
+    return
+  }
+  const chosen = await desktop.pickFile([
+    { name: '私钥', extensions: ['pem', 'key'] },
+    { name: '所有文件', extensions: ['*'] },
+  ])
+  if (!chosen) return
+  server.keyPath = normalizeLocalPath(chosen)
+}
 async function api<T>(url:string,data?:unknown):Promise<T>{
   let response: Response
   try {
     response = await fetch('/api'+url, data===undefined ? undefined : {method:'POST',headers:{'Content-Type':'application/json','X-DeployX-Client':'local-ui'},body:JSON.stringify(data)})
   } catch {
-    throw new Error('无法连接本地服务。请确认已在项目目录运行 pnpm dev（界面 http://127.0.0.1:5173），或 pnpm build 后运行 pnpm start（http://127.0.0.1:4318）。')
+    throw new Error(isDesktop.value
+      ? '部署服务已断开。请重新打开 DeployX；若刚关闭过，请稍等几秒再试。'
+      : '无法连接本地服务。请确认本地服务已启动。')
   }
   let body: { error?: string } = {}
   try { body = await response.json() } catch { /* non-json */ }
@@ -293,7 +375,153 @@ async function inspect(){await action('识别项目',async()=>{config.projectPat
 async function getFingerprint(){await action('读取指纹',async()=>{server.keyPath=normalizeLocalPath(server.keyPath);const r=await api<{fingerprint:string}>('/server/fingerprint',server);fingerprint.value=r.fingerprint;trusted.value=false})}
 async function connect(){await action('连接服务器',async()=>{if(!trusted.value)throw new Error('请先核实并确认服务器指纹');server.keyPath=normalizeLocalPath(server.keyPath);const r=await api<{id:string;report:string;requirements:Requirements}>('/server/connect',{...server,fingerprint:fingerprint.value});config.connectionId=r.id;report.value=r.report;requirements.value=r.requirements;bootstrapLog.value='';connected.value=true;server.password='';server.passphrase='';notice.value=r.requirements.missing.length?`连接成功。检测到缺失：${r.requirements.missing.join('、')}。可一键安装（Ubuntu/Debian）。`:'连接成功。认证信息仅保留在后台会话中，不写入配置文件。'})}
 async function bootstrapDeps(){await action('安装依赖',async()=>{if(!config.connectionId)throw new Error('请先连接服务器');const r=await api<{report:string;requirements:Requirements;output:string;packages:string[]}>('/server/bootstrap',{connectionId:config.connectionId});report.value=r.report;requirements.value=r.requirements;bootstrapLog.value=r.output;notice.value=r.requirements.missing.length?`已安装 ${r.packages.join('、')}，仍缺：${r.requirements.missing.join('、')}`:`已安装 ${r.packages.join('、')}，环境检测通过`})}
-function addSite(){if(!newSite.domain.trim())return;config.sites.push({seq:String(config.sites.length+1),domain:newSite.domain.trim(),siteKey:newSite.siteKey.trim(),port:newSite.port,selected:true});newSite.domain='';newSite.siteKey='';newSite.port=null}
+function addSite(){
+  const domain = normalizeDomain(newSite.domain)
+  if (!domain) {
+    error.value = '请填写域名，例如 example.com'
+    return
+  }
+  if (!/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/.test(domain)) {
+    error.value = `域名格式不正确：${domain}`
+    return
+  }
+  if (config.sites.some(s => s.domain === domain)) {
+    error.value = `域名已在清单中：${domain}`
+    return
+  }
+  error.value = ''
+  config.sites.push({
+    seq: String(config.sites.length + 1),
+    domain,
+    siteKey: newSite.siteKey.trim(),
+    port: newSite.port,
+    selected: true,
+  })
+  newSite.domain = ''
+  newSite.siteKey = ''
+  newSite.port = null
+  notice.value = `已添加 ${domain}`
+}
+function validateStep(index: number) {
+  if (index === 0) {
+    if (!config.projectPath.trim()) return '请填写或选择本地项目文件夹。'
+    if (!project.value) return '请先点「识别项目」，确认技术栈和产物目录。'
+  }
+  if (index === 1) {
+    if (!server.host.trim()) return '请填写服务器 IP 或主机名。'
+    if (!connected.value) return '请先获取指纹、勾选确认，并完成「测试连接」。'
+  }
+  if (index === 2) {
+    if (!config.sites.length) return '请先添加至少一个域名。'
+    if (!selected.value.length) return '请至少勾选一个本次要部署的站点。'
+  }
+  if (index === 3) {
+    if (!config.baseDir.trim()) return '请填写服务器存放根目录。'
+    if (config.https && !config.email.trim()) return '开启 HTTPS 时请填写证书通知邮箱。'
+  }
+  return ''
+}
+function goNext() {
+  const message = validateStep(step.value)
+  if (message) {
+    error.value = message
+    return
+  }
+  error.value = ''
+  step.value++
+}
+function newDeploy() {
+  if (job.value?.status === 'running') {
+    error.value = '部署仍在进行，请先等待完成或停止任务。'
+    return
+  }
+  if (!window.confirm('将清空当前填写内容并开始新的部署。未保存的修改会丢失。')) return
+  Object.assign(config, createDefaultConfig())
+  Object.assign(server, { host: '', port: 22, username: 'ubuntu', auth: 'key', keyPath: '', passphrase: '', password: '', agent: '', fingerprint: '' })
+  project.value = null
+  plan.value = null
+  job.value = null
+  fingerprint.value = ''
+  trusted.value = false
+  report.value = ''
+  connected.value = false
+  requirements.value = null
+  bootstrapLog.value = ''
+  acknowledge.value = false
+  csv.value = ''
+  importMode.value = 'manual'
+  newSite.domain = ''
+  newSite.siteKey = ''
+  newSite.port = null
+  error.value = ''
+  notice.value = '已开始新的部署配置。'
+  step.value = 0
+}
+async function saveDraft(){
+  const {envText,sourceId,connectionId,...safe}=config
+  void envText; void sourceId; void connectionId
+  const draft = {
+    config: { ...safe, syncSheet: false },
+    server: {
+      host: server.host,
+      port: server.port,
+      username: server.username,
+      auth: server.auth,
+      keyPath: server.keyPath,
+    },
+  }
+  try {
+    await api('/draft', { draft })
+    notice.value = '草稿已保存在本机应用数据中（不含密码、私钥口令和环境变量值）。'
+  } catch {
+    localStorage.setItem('deployx-draft', JSON.stringify(draft))
+    notice.value = '草稿已保存在本机（备用存储）。不含认证敏感信息。'
+  }
+}
+async function loadDraft(){
+  try {
+    let draft: { config?: Record<string, unknown>; server?: Record<string, unknown> } | null = null
+    try {
+      const remote = await api<{ draft: typeof draft }>('/draft')
+      draft = remote.draft
+    } catch {
+      const saved = localStorage.getItem('deployx-draft') || localStorage.getItem('launchpad-draft')
+      draft = saved ? JSON.parse(saved) : null
+    }
+    if (!draft) {
+      notice.value = '还没有保存的草稿。'
+      return
+    }
+    const payload = draft.config ? draft : { config: draft as Record<string, unknown>, server: undefined }
+    Object.assign(config, createDefaultConfig(), payload.config || {})
+    config.syncSheet = false
+    config.sourceId = ''
+    config.connectionId = ''
+    if (payload.server) {
+      Object.assign(server, {
+        host: String(payload.server.host || ''),
+        port: Number(payload.server.port || 22),
+        username: String(payload.server.username || 'ubuntu'),
+        auth: String(payload.server.auth || 'key'),
+        keyPath: String(payload.server.keyPath || ''),
+        passphrase: '',
+        password: '',
+        agent: '',
+        fingerprint: '',
+      })
+    }
+    if (importMode.value === 'google') importMode.value = 'manual'
+    if (server.auth === 'agent') server.auth = 'key'
+    clearConnection()
+    plan.value = null
+    acknowledge.value = false
+    project.value = null
+    notice.value = '已恢复草稿。项目与服务器连接已断开，请重新识别项目并测试连接。'
+    step.value = 0
+  } catch {
+    error.value = '草稿读取失败'
+  }
+}
 async function importCsv(){await action('导入清单',async()=>{const r=await api<{sites:Site[]}>('/import/csv',{text:csv.value});config.sites=r.sites;config.sourceId='';config.syncSheet=false;notice.value=`导入 ${r.sites.length} 个站点`})}
 async function fileCsv(e:Event){const f=(e.target as HTMLInputElement).files?.[0];if(!f)return;csv.value=await decodeCsvFile(f);await importCsv()}
 async function decodeCsvFile(file:File){
@@ -314,8 +542,6 @@ async function openJob(id:string){await action('读取任务',async()=>{job.valu
 function retryFailed(){const domains=new Set(job.value?.results.filter(r=>r.status==='failed').map(r=>r.domain));config.sites.forEach(s=>s.selected=domains.has(s.domain));step.value=4;plan.value=null;notice.value='已选择失败站点。请先处理日志中的问题，再生成新的执行计划。'}
 function download(name:string,text:string){const url=URL.createObjectURL(new Blob(['\uFEFF'+text],{type:'text/plain;charset=utf-8'}));const a=document.createElement('a');a.href=url;a.download=name;a.click();URL.revokeObjectURL(url)}
 function exportResults(){const esc=(v:unknown)=>'"'+String(v??'').replace(/^[=+@-]/,"'$&").replaceAll('"','""')+'"';download('部署结果.csv',['domain,siteKey,Port,status,error',...(job.value?.results||[]).map(r=>[r.domain,r.siteKey,r.status==='deployed'?r.port:'',r.status,r.error].map(esc).join(','))].join('\r\n'))}
-function saveDraft(){const {envText,sourceId,connectionId,...safe}=config;void envText;void sourceId;void connectionId;localStorage.setItem('deployx-draft',JSON.stringify({...safe,syncSheet:false}));notice.value='草稿已保存在本机浏览器，不包含环境变量值或认证信息。'}
-function loadDraft(){try{const saved=localStorage.getItem('deployx-draft')||localStorage.getItem('launchpad-draft');if(saved){Object.assign(config,JSON.parse(saved));config.syncSheet=false;config.sourceId='';if(importMode.value==='google')importMode.value='manual';if(server.auth==='agent')server.auth='key'}notice.value='已恢复草稿，请重新识别项目并连接服务器。'}catch{error.value='草稿读取失败'}}
 watch(()=>[server.host,server.port,server.username,server.auth,server.keyPath],()=>{clearConnection(undefined, true)})
 watch(()=>JSON.stringify(config),()=>{plan.value=null;acknowledge.value=false})
 let timer:ReturnType<typeof setInterval>
@@ -332,7 +558,7 @@ onUnmounted(()=>clearInterval(timer))
 <div class="shell">
   <aside class="sidebar">
     <a class="brand" href="#" @click.prevent="step=0"><span class="brand-icon">↗</span><span>DeployX<small>部署工作台</small></span></a>
-    <div class="workspace-label">WORKSPACE <span>LOCAL</span></div><button class="nav-home" @click="step=0"><span>◈</span> 新建部署 <b>＋</b></button><div class="nav-caption">部署向导</div>
+    <div class="workspace-label">WORKSPACE <span>LOCAL</span></div><button class="nav-home" @click="newDeploy"><span>◈</span> 新建部署 <b>＋</b></button><div class="nav-caption">部署向导</div>
     <nav><button v-for="(item,i) in steps" :key="item.name" :aria-label="item.name" :class="['nav-step',{active:step===i}]" @click="step=i"><span class="step-number">{{i+1}}</span><span>{{item.name}}<small>{{item.desc}}</small></span><span v-if="step===i" class="active-dot"></span></button></nav>
     <div class="sidebar-bottom"><span class="shield">◇</span><strong>在你的电脑上运行</strong><p>项目路径、私钥和密码只在本机使用。<br>上传到服务器的，主要是构建好的网站文件。</p><div class="local-status"><i :class="{off:!online}"></i>{{online?'本地服务已连接':'本地服务未连接'}}</div></div>
   </aside>
@@ -342,13 +568,13 @@ onUnmounted(()=>clearInterval(timer))
       <div class="page-heading"><div><div class="eyebrow">FROM LOCAL TO LIVE</div><h1>{{step===5?'看着网站一点点上线。':'把本地项目，部署到你的域名。'}}</h1><p>{{steps[step]?.brief}}</p></div><div class="step-counter"><strong>0{{step+1}}</strong><span>/ 06</span></div></div>
       <div v-if="error" class="alert error" role="alert"><b>需要处理</b><span>{{error}}</span><button @click="error=''" aria-label="关闭错误">×</button></div>
       <div v-if="notice" class="alert success" role="status"><span>{{notice}}</span><button @click="notice=''" aria-label="关闭提示">×</button></div>
-      <div v-if="!online" class="alert warning">本地服务还没连上。请先在本项目目录打开终端，运行 <code>pnpm dev</code>（开发）或 <code>pnpm start</code>（正式启动）。</div>
+      <div v-if="!online" class="alert warning">{{ isDesktop ? '本地服务还没连上。请重新打开 DeployX；若刚关闭过，请稍等几秒再试。' : '本地服务还没连上。请确认本机 DeployX 服务已启动。' }}</div>
       <div class="content-grid">
         <section class="workspace-card">
           <div class="card-heading"><div><span class="section-index">第 {{step+1}} 步</span><h2>{{steps[step]?.name}}</h2><p>{{steps[step]?.desc}}</p></div><span class="tag">{{step===5?'进行中':'向导'}}</span></div>
           <div class="step-brief tip"><span>{{step+1}}</span><p><strong>{{stepHelp.title}}</strong>{{stepHelp.body}}</p></div>
           <div v-if="step===0" class="card-body">
-            <label class="field-label">本地项目文件夹 <span>*</span></label><div class="input-action"><input id="project-path" :value="config.projectPath" placeholder="例如 D:\Project\Apps\consumer" @input="onProjectPathInput"/><button class="button secondary" :disabled="!!busy||!config.projectPath" @click="inspect">{{busy==='识别项目'?'识别中…':'识别项目'}}</button></div><p class="field-help">填包含 <code>package.json</code> 的文件夹路径。推荐先点「识别项目」，系统会自动选好下面的选项。</p>
+            <label class="field-label">本地项目文件夹 <span>*</span></label><div class="input-action"><input id="project-path" :value="config.projectPath" :placeholder="pathPlaceholder" @input="onProjectPathInput"/><button v-if="isDesktop" class="button secondary" type="button" @click="pickProjectDir">选择文件夹</button><button class="button secondary" :disabled="!!busy||!config.projectPath" @click="inspect">{{busy==='识别项目'?'识别中…':'识别项目'}}</button></div><p class="field-help">选择或填写包含 <code>package.json</code> 的文件夹。推荐先点「识别项目」，系统会自动选好下面的选项。</p>
             <div v-if="project" class="detected"><span class="check-circle">✓</span><div><strong>{{project.name}}</strong><p>{{project.detection || (project.label || project.framework.toUpperCase())}} · 发现 {{project.scripts.length}} 个脚本 · {{project.envKeys.length}} 个环境变量名</p></div><span class="tag green">已识别</span></div>
             <label class="field-label">你的项目用什么技术？</label><div class="framework-grid five"><button v-for="f in frameworkOptions" :key="f.id" :class="['framework',{selected:config.framework===f.id}]" @click="selectFramework(f.id)"><span :class="['framework-icon',f.id]">{{f.icon}}</span><strong>{{f.name}}</strong><small>{{f.hint}}</small><em class="framework-ssr">{{f.ssr}}</em><span class="radio-mark"></span></button></div>
             <label class="field-label">网站怎么跑在服务器上？</label><div class="mode-cards"><button type="button" :class="['mode-card',{chosen:config.mode==='static'}]" @click="selectMode('static')"><strong>静态网站</strong><span>把网页文件交给 Nginx 直接打开（多数前端项目选这个）</span></button><button type="button" :class="['mode-card',{chosen:config.mode==='node',disabled:modeLockedToStatic}]" :disabled="modeLockedToStatic" @click="selectMode('node')"><strong>动态网站（Node）</strong><span>{{modeLockedToStatic?'Vue / React 请改选 Nuxt / Next':'服务器跑 Node；Nginx 反向代理到该程序'}}</span></button></div>
@@ -374,7 +600,7 @@ onUnmounted(()=>clearInterval(timer))
           <div v-if="step===1" class="card-body">
             <div class="form-grid three"><label>服务器 IP 或主机名<input v-model="server.host" placeholder="例如 203.0.113.10"/><span class="field-help">云厂商控制台里的公网 IP</span></label><label>SSH 端口<input type="number" v-model="server.port"/><span class="field-help">默认 22，一般不用改</span></label><label>登录用户名<input v-model="server.username" placeholder="ubuntu"/><span class="field-help">常见：ubuntu / root</span></label></div>
             <label class="field-label">怎么登录服务器？</label><div class="segmented"><button v-for="a in [{id:'key',name:'SSH 私钥（推荐）'},{id:'password',name:'密码'}]" :key="a.id" :class="{chosen:server.auth===a.id}" @click="server.auth=a.id">{{a.name}}</button></div>
-            <template v-if="server.auth==='key'"><label>私钥文件路径<input :value="server.keyPath" placeholder="C:\Users\你\.ssh\id_ed25519 或云厂商下载的 .pem" @input="onKeyPathInput"/><span class="field-help">从资源管理器复制路径时若带引号，会自动去掉。</span></label><label>私钥口令 <small>多数情况不用填</small><input v-model="server.passphrase" type="password" autocomplete="off" placeholder="只有加密过的私钥才需要"/></label></template>
+            <template v-if="server.auth==='key'"><label>私钥文件路径<div class="input-action"><input :value="server.keyPath" :placeholder="keyPathPlaceholder" @input="onKeyPathInput"/><button v-if="isDesktop" class="button secondary" type="button" @click="pickKeyFile">选择文件</button></div><span class="field-help">从资源管理器复制路径时若带引号，会自动去掉。</span></label><label>私钥口令 <small>多数情况不用填</small><input v-model="server.passphrase" type="password" autocomplete="off" placeholder="只有加密过的私钥才需要"/></label></template>
             <label v-if="server.auth==='password'">SSH 密码<input v-model="server.password" type="password" autocomplete="off" placeholder="仅本次连接使用，不会写入草稿"/></label>
             <div class="tip"><span>◇</span><p><strong>按顺序点下面两个按钮。</strong>「指纹」是一串校验码，用来确认连对了机器。服务器建议 Ubuntu；静态网站需要 Nginx；动态网站还需要 Node 22+ 和 PM2；开 HTTPS 需要 Certbot。</p></div>
             <button class="button secondary" :disabled="!!busy||!server.host" @click="getFingerprint">{{busy==='读取指纹'?'正在读取…':'① 获取服务器指纹'}}</button><div v-if="fingerprint" class="fingerprint"><small>服务器指纹（SHA-256）</small><code>{{fingerprint}}</code><label class="check-row"><input type="checkbox" v-model="trusted"/><span>我已核对，这就是我的服务器</span></label></div><button class="button primary" :disabled="!!busy||!trusted" @click="connect">{{busy==='连接服务器'?'连接中…':'② 测试连接'}}</button>
@@ -397,7 +623,7 @@ onUnmounted(()=>clearInterval(timer))
             <label class="check-row"><input type="checkbox" v-model="config.requireSiteKey"/><span>每个站点必须填写 SITE_KEY<small>多站点 / CMS 项目常开；普通一个域名的项目可关掉。</small></span></label>
           </div>
           <div v-if="step===3" class="card-body">
-            <div class="form-grid"><label>部署方式（与第 1 步一致即可）<select v-model="config.mode"><option value="static">静态网站 · Nginx 直接托管</option><option value="node">动态网站 · Node + Nginx 反向代理</option></select><span class="field-help">反向代理：用户访问你的域名时，由 Nginx 把请求转给后台的 Node 程序。</span></label><label>产物文件夹名<input v-model="config.output" placeholder="dist"/><span class="field-help">应与第 1 步识别结果一致</span></label></div>
+            <div class="form-grid"><label>部署方式（与第 1 步一致，如需修改请返回修改）<input :value="overviewModeLabel" readonly/><span class="field-help">反向代理：用户访问你的域名时，由 Nginx 把请求转给后台的 Node 程序。</span></label><label>产物文件夹名<input v-model="config.output" placeholder="dist"/><span class="field-help">应与第 1 步识别结果一致</span></label></div>
             <div v-if="config.mode==='node'" class="form-grid"><label>Node 启动文件<input v-model="config.entry" placeholder="dist/server/entry.mjs"/></label><label>起始内部端口<input type="number" v-model="config.startPort" min="1024" max="65535"/><span class="field-help">给「未填写端口」的站点自动分配；已填过或以前部署过的会优先沿用，不会互相抢。</span></label></div>
             <label v-if="config.mode==='static'" class="check-row"><input type="checkbox" v-model="config.spa"/><span>启用 SPA 路由回退<small>Vue / React 多页面路由通常要开；Astro / Nuxt / Next 静态页通常关。</small></span></label>
             <label>服务器上的存放根目录<input v-model="config.baseDir"/><span class="field-help">每个域名一个子目录；新版本进 releases，current 指向正在用的版本。</span></label>
@@ -413,10 +639,10 @@ onUnmounted(()=>clearInterval(timer))
             <template v-else><div class="plan-stats"><div><strong>{{plan.sites.length}}</strong><span>待部署站点</span></div><div><strong>{{plan.https?'HTTPS':'HTTP'}}</strong><span>访问协议</span></div><div><strong>{{plan.mode==='node'?'动态 · Node':'静态 · Nginx'}}</strong><span>运行方式</span></div></div><div class="pipeline"><span v-for="(s,i) in plan.steps" :key="s"><i>{{i+1}}</i>{{s}}</span></div><div class="site-table"><table><thead><tr><th>域名</th><th>内部端口</th><th>服务器目录</th></tr></thead><tbody><tr v-for="s in plan.sites" :key="s.domain"><td>{{s.domain}}</td><td>{{s.port||'静态（无端口）'}}</td><td class="mono">{{plan.baseDir}}/{{s.domain.replaceAll('.','-')}}</td></tr></tbody></table></div><div class="tip"><span>i</span><div><p v-for="n in plan.notes" :key="n">{{n}}</p><p v-if="plan.https">开始部署即表示同意为这些域名申请证书，并接受 <a href="https://letsencrypt.org/repository/" target="_blank" rel="noopener">Let's Encrypt 服务条款</a>。</p></div></div><label class="check-row"><input v-model="acknowledge" type="checkbox"/><span>我已确认服务器、域名范围和设置，可以开始真正部署。</span></label><button class="button primary full" :disabled="!acknowledge||!!busy||job?.status==='running'" @click="start">开始部署 {{plan.sites.length}} 个站点 ↗</button></template>
           </div>
           <div v-if="step===5" class="card-body">
-            <template v-if="job"><div class="job-heading"><div><span :class="['tag',job.status==='complete'?'green':'']">{{statusLabel(job.status)}}</span><h3>{{job.current||'部署任务'}}</h3><p>{{job.phase}} · 已处理 {{job.results.length}} / {{job.total}} 个站点</p></div><strong class="progress-number">{{progress}}<small>%</small></strong></div><div class="progress-track"><div :style="{width:progress+'%'}"></div></div><div class="job-summary"><span><i class="dot green-dot"></i>{{successful}} 成功</span><span><i class="dot red-dot"></i>{{failed}} 失败</span><span>{{job.total-job.results.length}} 还在排队</span></div><div class="job-buttons"><button v-if="job.status==='running'" class="button secondary" :disabled="job.stopRequested||!!busy" @click="stop">{{job.stopRequested?'将在当前站完成后停止':'完成当前站后停止'}}</button><button v-if="failed&&job.status!=='running'" class="button secondary" @click="retryFailed">只重试失败的站点</button><button class="button secondary" @click="exportResults">导出结果 CSV</button><button class="text-button" @click="download('部署日志.txt',job!.logs.map(l=>l.time+' '+l.text).join('\n'))">下载日志</button></div><div class="terminal"><div class="terminal-bar"><span>● ● ●</span><b>部署日志</b><small>{{job.status==='running'?'进行中':'已结束'}}</small></div><div class="terminal-content" aria-live="polite"><p v-for="(l,i) in job.logs.slice(-100)" :key="i"><time>{{l.time.slice(11,19)}}</time><span>{{l.text}}</span></p><p v-if="!job.logs.length">正在准备任务…</p></div></div><div v-if="job.sheetStatus" class="tip">{{job.sheetStatus}}</div><div class="result-list"><div v-for="r in job.results" :key="r.domain"><span :class="['result-icon',r.status]">{{r.status==='deployed'?'✓':'!'}}</span><strong>{{r.domain}}</strong><span>{{r.status==='deployed'?(r.port||'静态'):'未完成'}}</span><small>{{r.error||'本站步骤已完成'}}</small></div></div></template>
-            <div v-else class="plan-empty"><div class="large-symbol">↗</div><h3>部署开始后，进度会出现在这里。</h3><p>完成前面的向导并确认执行后，可在此查看每个站点的进度与日志。</p><button class="button primary" @click="step=0">从头配置一次部署</button></div><div v-if="history.length" class="history"><h3>最近任务</h3><button v-for="h in history" :key="h.id" @click="openJob(h.id)"><span>{{new Date(h.createdAt).toLocaleString()}}</span><strong>{{h.total}} 个站点</strong><span>{{statusLabel(h.status)}} →</span></button></div>
+            <template v-if="job"><div class="job-heading"><div><span :class="['tag',job.status==='complete'?'green':'']">{{statusLabel(job.status)}}</span><h3>{{job.current||'部署任务'}}</h3><p>{{job.phase}} · 已处理 {{job.results.length}} / {{job.total}} 个站点<span v-if="lastLogAt"> · 最近日志 {{lastLogAt}}</span></p></div><strong class="progress-number">{{progressHeadline}}<small v-if="showProgressPercent">%</small></strong></div><div class="progress-track"><div :style="{width:(job.status==='running' && !job.results.length ? 8 : progress)+'%'}"></div></div><div class="job-summary"><span><i class="dot green-dot"></i>{{successful}} 成功</span><span><i class="dot red-dot"></i>{{failed}} 失败</span><span>{{job.total-job.results.length}} 还在排队</span></div><div class="job-buttons"><button v-if="job.status==='running'" class="button secondary" :disabled="job.stopRequested||!!busy" @click="stop">{{job.stopRequested?'将在当前站完成后停止':'完成当前站后停止'}}</button><button v-if="failed&&job.status!=='running'" class="button secondary" @click="retryFailed">只重试失败的站点</button><button class="button secondary" @click="exportResults">导出结果 CSV</button><button class="text-button" @click="download('部署日志.txt',job!.logs.map(l=>l.time+' '+l.text).join('\n'))">下载日志</button></div><div class="terminal"><div class="terminal-bar"><span>● ● ●</span><b>部署日志</b><small>{{job.status==='running'?'进行中':'已结束'}}</small></div><div class="terminal-content" aria-live="polite"><p v-for="(l,i) in job.logs.slice(-100)" :key="i"><time>{{l.time.slice(11,19)}}</time><span>{{l.text}}</span></p><p v-if="!job.logs.length">正在准备任务…</p></div></div><div v-if="job.sheetStatus" class="tip">{{job.sheetStatus}}</div><div class="result-list"><div v-for="r in job.results" :key="r.domain"><span :class="['result-icon',r.status]">{{r.status==='deployed'?'✓':'!'}}</span><strong>{{r.domain}}</strong><span>{{r.status==='deployed'?(r.port||'静态'):'未完成'}}</span><small>{{r.error||'本站步骤已完成'}}</small></div></div></template>
+            <div v-else class="plan-empty"><div class="large-symbol">↗</div><h3>部署开始后，进度会出现在这里。</h3><p>完成前面的向导并确认执行后，可在此查看每个站点的进度与日志。</p><button class="button primary" @click="newDeploy">从头配置一次部署</button></div><div v-if="history.length" class="history"><h3>最近任务</h3><button v-for="h in history" :key="h.id" @click="openJob(h.id)"><span>{{new Date(h.createdAt).toLocaleString()}}</span><strong>{{h.total}} 个站点</strong><span>{{statusLabel(h.status)}} →</span></button></div>
           </div>
-          <footer v-if="step<4" class="card-footer"><button class="text-button" :disabled="step===0" @click="step--">← 上一步</button><span>现在只是在填表，还不会上线</span><button class="button primary" @click="step++">{{step===3?'去预览计划':'下一步'}} →</button></footer>
+          <footer v-if="step<4" class="card-footer"><button class="text-button" :disabled="step===0" @click="step--">← 上一步</button><span>现在只是在填表，还不会上线</span><button class="button primary" @click="goNext">{{step===3?'去预览计划':'下一步'}} →</button></footer>
         </section>
           <aside class="context-panel"><div class="context-card"><span class="eyebrow">本次部署一览</span><h3>现在选了什么</h3><div class="overview-row"><span>技术栈</span><b>{{(project?.label || config.framework).toString().toUpperCase()}}</b></div><div class="overview-row"><span>运行方式</span><b>{{overviewModeLabel}}</b></div><div class="overview-row"><span>产物文件夹</span><b>{{config.output || '—'}}</b></div><div class="overview-row"><span>目标服务器</span><b>{{server.host||'还没连接'}}</b></div><div class="overview-row"><span>勾选站点数</span><b>{{selected.length}} 个</b></div><div class="overview-row"><span>上线后检查</span><b>{{{minimal:'最小检查',http:'打开首页',full:'更仔细',custom:'自定义路径'}[config.validation]}}</b></div><div class="divider"></div><div class="readiness"><strong>准备进度</strong><span>{{readyCount}} / 4</span></div><div class="readiness-bars"><i v-for="n in 4" :key="n" :class="{filled:n<=readyCount}"></i></div><p class="context-note">{{project?.detection || '识别项目 → 连接服务器 → 勾选域名 → 预览计划 → 确认执行'}}</p></div><div class="help-card"><span class="help-symbol">✧</span><h3>{{stepHelp.title}}</h3><p>{{stepHelp.body}}</p><div class="help-line"></div><small>支持 Vue · React · Astro · Nuxt · Next（静态 / 动态）</small></div><div class="privacy-note">◇ 私钥、密码和环境变量值不会写入浏览器草稿。</div></aside>
       </div><div class="page-bottom"><span>DeployX · 本机部署工作台</span><span>复杂步骤交给工具，最终确认留给你。</span></div>

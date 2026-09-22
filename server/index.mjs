@@ -51,7 +51,39 @@ async function body(req) {
   for await (const chunk of req) { size += chunk.length; assert(size <= 2 * 1024 * 1024, '请求过大（最多 2MB）'); data += chunk }
   return data ? JSON.parse(data) : {}
 }
-function json(res, status, value) { res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' }); res.end(JSON.stringify(value)) }
+function friendlyError(error) {
+  const message = String(error?.message || error || '')
+  if (/ENOENT|no such file|realpath/i.test(message) && /package\.json|project|path|目录|文件夹/i.test(message + (error?.path || ''))) {
+    return '找不到这个项目文件夹，它可能已移动或被删除。请重新选择文件夹。'
+  }
+  if (/ENOENT|no such file/i.test(message)) {
+    return '找不到指定的文件或文件夹，请检查路径后重试。'
+  }
+  if (/package\.json/i.test(message) && /找不到|不存在|no such|ENOTDIR/i.test(message)) {
+    return '这个目录不是可识别的前端项目，请选择包含 package.json 的目录。'
+  }
+  return redact(message)
+}
+async function readDraft() {
+  try {
+    return JSON.parse(await readFile(path.join(dataDir, 'draft.json'), 'utf8'))
+  } catch {
+    return null
+  }
+}
+async function writeDraft(payload) {
+  const temp = path.join(dataDir, 'draft.tmp')
+  await writeFile(temp, JSON.stringify(payload ?? null), { mode: 0o600 })
+  await rename(temp, path.join(dataDir, 'draft.json'))
+}
+function json(res, status, value) {
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
+  })
+  res.end(JSON.stringify(value))
+}
 const server = http.createServer(async (req, res) => {
   try {
     assert([`localhost:${port}`, `127.0.0.1:${port}`, 'localhost:5173', '127.0.0.1:5173'].includes(req.headers.host), '不允许的 Host')
@@ -60,8 +92,18 @@ const server = http.createServer(async (req, res) => {
       if (req.headers.origin) assert(origins.has(req.headers.origin), '不允许跨站请求本机部署服务')
       if (req.method === 'POST') assert((req.headers['x-deployx-client'] === 'local-ui' || req.headers['x-launchpad-client'] === 'local-ui') && req.headers['content-type']?.includes('application/json'), '请求必须来自本机控制台')
       const b = req.method === 'POST' ? await body(req) : {}
-      if (url.pathname === '/api/health') return json(res,200,{ ready:true, activeJob, platform:process.platform, startedAt })
-      if (url.pathname === '/api/project' && req.method === 'POST') return json(res,200,await inspectProject(b.path))
+      if (url.pathname === '/api/health') return json(res,200,{ ready:true, activeJob, platform:process.platform, startedAt, desktop:!!process.env.DEPLOYX_DATA_DIR })
+      if (url.pathname === '/api/draft' && req.method === 'GET') return json(res,200,{ draft: await readDraft() })
+      if (url.pathname === '/api/draft' && req.method === 'POST') {
+        if (b.clear) { await writeDraft(null); return json(res,200,{ ok:true }) }
+        assert(b.draft && typeof b.draft === 'object', '草稿格式无效')
+        await writeDraft(b.draft)
+        return json(res,200,{ ok:true })
+      }
+      if (url.pathname === '/api/project' && req.method === 'POST') {
+        try { return json(res,200,await inspectProject(b.path)) }
+        catch (e) { return json(res,400,{ error: friendlyError(e) }) }
+      }
       if (url.pathname === '/api/import/csv' && req.method === 'POST') return json(res,200,sitesFromRows(parseCsv(b.text)))
       if (url.pathname === '/api/import/sheets' && req.method === 'POST') { const parsed = await loadSheet(b); const id = randomUUID(); sources.set(id,b); return json(res,200,{...parsed,sourceId:id}) }
       if (url.pathname === '/api/server/fingerprint' && req.method === 'POST') return json(res,200,{ fingerprint:await connect(b,true) })
@@ -146,7 +188,7 @@ const server = http.createServer(async (req, res) => {
     const types={'.html':'text/html; charset=utf-8','.js':'text/javascript','.css':'text/css','.svg':'image/svg+xml','.ico':'image/x-icon'}
     try { const bytes=await readFile(file); res.writeHead(200,{'Content-Type':types[path.extname(file)]||'application/octet-stream','X-Content-Type-Options':'nosniff'}); res.end(bytes) }
     catch { if(!res.headersSent)res.writeHead(404); res.end('请先运行 pnpm build，或使用 pnpm dev 启动开发界面。') }
-  } catch(e) { if(!res.headersSent)json(res,400,{error:redact(e.message)}); else res.end() }
+  } catch(e) { if(!res.headersSent)json(res,400,{error:friendlyError(e)}); else res.end() }
 })
 server.on('error', err => {
   if (err && err.code === 'EADDRINUSE') {

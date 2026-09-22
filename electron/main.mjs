@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, shell } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron'
 import { spawn } from 'node:child_process'
 import net from 'node:net'
 import path from 'node:path'
@@ -12,6 +12,7 @@ const PORT_SPAN = 40
 let mainWindow = null
 let apiProcess = null
 let stopping = false
+let allowClose = false
 let apiBase = `http://127.0.0.1:${PREFERRED_PORT}`
 let apiLogs = ''
 let startingApi = false
@@ -57,7 +58,6 @@ function findFreePort(startPort) {
       const server = net.createServer()
       server.unref()
       server.once('error', () => tryPort(port + 1))
-      // exclusive：避免系统误判「端口空闲」，导致小白用户看到占用报错
       server.listen({ port, host: '127.0.0.1', exclusive: true }, () => {
         server.close(err => (err ? tryPort(port + 1) : resolve(port)))
       })
@@ -112,6 +112,7 @@ function spawnApi(nodeBin, entry, root, port, dataDir) {
     PORT: String(port),
     DEPLOYX_DATA_DIR: dataDir,
     NODE_USE_ENV_PROXY: '1',
+    DEPLOYX_DESKTOP: '1',
   }
   const child = spawn(nodeBin, [entry], {
     cwd: root,
@@ -204,6 +205,39 @@ function stopApi() {
   killChild(child)
 }
 
+async function fetchActiveJobId() {
+  try {
+    const res = await fetch(`${apiBase}/api/health`)
+    if (!res.ok) return null
+    const data = await res.json()
+    return data.activeJob || null
+  } catch {
+    return null
+  }
+}
+
+async function requestStopJob(jobId) {
+  try {
+    await fetch(`${apiBase}/api/jobs/${jobId}/stop`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-DeployX-Client': 'local-ui',
+      },
+      body: '{}',
+    })
+  } catch {
+    /* ignore */
+  }
+}
+
+function forceCloseWindow() {
+  allowClose = true
+  stopApi()
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.destroy()
+  mainWindow = null
+}
+
 async function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1280,
@@ -214,6 +248,7 @@ async function createWindow() {
     title: 'DeployX',
     autoHideMenuBar: true,
     webPreferences: {
+      preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
@@ -226,8 +261,61 @@ async function createWindow() {
     return { action: 'deny' }
   })
 
+  mainWindow.on('close', e => {
+    if (allowClose || stopping) return
+    e.preventDefault()
+    void (async () => {
+      const jobId = await fetchActiveJobId()
+      if (!jobId) {
+        forceCloseWindow()
+        if (process.platform !== 'darwin') app.quit()
+        return
+      }
+      const { response } = await dialog.showMessageBox(mainWindow, {
+        type: 'warning',
+        buttons: ['继续等待', '停止任务并退出'],
+        defaultId: 0,
+        cancelId: 0,
+        title: '部署仍在进行',
+        message: '现在还有部署任务在跑。',
+        detail:
+          '关闭窗口会中断本机对任务的监控；服务器上的命令可能还在执行。\n\n建议等任务完成，或选择「停止任务并退出」（会请求完成当前站点后停止）。',
+      })
+      if (response !== 1) return
+      await requestStopJob(jobId)
+      forceCloseWindow()
+      if (process.platform !== 'darwin') app.quit()
+    })()
+  })
+
   await mainWindow.loadURL(apiBase)
 }
+
+ipcMain.handle('deployx:pick-directory', async () => {
+  const win = BrowserWindow.getFocusedWindow() || mainWindow
+  const result = await dialog.showOpenDialog(win, {
+    title: '选择本地项目文件夹',
+    properties: ['openDirectory'],
+  })
+  if (result.canceled || !result.filePaths[0]) return null
+  return result.filePaths[0]
+})
+
+ipcMain.handle('deployx:pick-file', async (_event, filters) => {
+  const win = BrowserWindow.getFocusedWindow() || mainWindow
+  const result = await dialog.showOpenDialog(win, {
+    title: '选择文件',
+    properties: ['openFile'],
+    filters: Array.isArray(filters) && filters.length
+      ? filters
+      : [
+          { name: '私钥', extensions: ['pem', 'key', 'pub', '*'] },
+          { name: '所有文件', extensions: ['*'] },
+        ],
+  })
+  if (result.canceled || !result.filePaths[0]) return null
+  return result.filePaths[0]
+})
 
 const gotLock = app.requestSingleInstanceLock()
 if (!gotLock) {
@@ -251,16 +339,22 @@ if (!gotLock) {
   })
 
   app.on('window-all-closed', () => {
-    stopApi()
-    if (process.platform !== 'darwin') app.quit()
+    if (process.platform !== 'darwin') {
+      stopApi()
+      app.quit()
+    }
   })
 
-  app.on('before-quit', () => stopApi())
+  app.on('before-quit', () => {
+    allowClose = true
+    stopApi()
+  })
 
   app.on('activate', async () => {
     if (BrowserWindow.getAllWindows().length === 0) {
       try {
         stopping = false
+        allowClose = false
         if (!apiProcess) await startApi()
         await createWindow()
       } catch (error) {
