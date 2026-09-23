@@ -172,7 +172,8 @@ const config = reactive(createDefaultConfig())
 const server = reactive({host:'',port:22,username:'ubuntu',auth:'key',keyPath:'',passphrase:'',password:'',agent:'',fingerprint:''})
 const fingerprint = ref(''), trusted = ref(false), report = ref(''), connected = ref(false)
 const requirements = ref<Requirements | null>(null), bootstrapLog = ref('')
-const importMode = ref('manual'), csv = ref(''), range = reactive({from:1,to:50})
+const importMode = ref('manual'), csv = ref(''), csvFileName = ref(''), range = reactive({from:1,to:50})
+const csvFileInput = ref<HTMLInputElement | null>(null)
 const newSite = reactive({domain:'',siteKey:'',port:null as number|null})
 const acknowledge = ref(false), customPaths = ref('/\n/sitemap.xml')
 const selected = computed(()=>config.sites.filter(s=>s.selected))
@@ -334,18 +335,40 @@ function selectFramework(f:string){
   project.value = null
 }
 function applyDetected(p: Project) {
+  const lockedToStatic = p.framework === 'vue' || p.framework === 'react'
+  // 识别时保留用户已选的运行方式，避免被检测结果强行改回静态
+  const preferredMode: 'static' | 'node' = lockedToStatic
+    ? 'static'
+    : (config.mode === 'node' ? 'node' : config.mode === 'static' ? 'static' : (p.mode === 'node' ? 'node' : 'static'))
   config.framework = p.framework
-  Object.assign(config, {
-    mode: p.mode,
-    output: p.output,
-    entry: p.entry || '',
-    spa: p.spa,
-    requireSiteKey: p.requireSiteKey ?? (p.framework === 'astro'),
-    buildScript: p.buildScript || config.buildScript,
-    runtimeInstall: !!p.runtimeInstall,
-    runner: p.runner || (p.mode === 'node' ? 'node-file' : 'static'),
-  })
+  config.requireSiteKey = p.requireSiteKey ?? (p.framework === 'astro')
+  config.buildScript = p.buildScript || config.buildScript
   project.value = p
+  if (preferredMode === p.mode) {
+    Object.assign(config, {
+      mode: p.mode,
+      output: p.output,
+      entry: p.entry || '',
+      spa: p.spa,
+      runtimeInstall: !!p.runtimeInstall,
+      runner: p.runner || (p.mode === 'node' ? 'node-file' : 'static'),
+    })
+  } else {
+    selectMode(preferredMode)
+  }
+}
+function clearProjectPath() {
+  config.projectPath = ''
+  project.value = null
+}
+function clearKeyFile() {
+  server.keyPath = ''
+}
+function clearAllSites() {
+  if (!config.sites.length) return
+  if (!window.confirm(`确定清空全部 ${config.sites.length} 个站点吗？`)) return
+  config.sites = []
+  notice.value = '已清空站点清单'
 }
 function selectMode(mode: 'static' | 'node') {
   if ((config.framework === 'vue' || config.framework === 'react') && mode === 'node') {
@@ -461,6 +484,7 @@ function newDeploy() {
   bootstrapLog.value = ''
   acknowledge.value = false
   csv.value = ''
+  csvFileName.value = ''
   importMode.value = 'manual'
   newSite.domain = ''
   newSite.siteKey = ''
@@ -535,7 +559,19 @@ async function loadDraft(){
   }
 }
 async function importCsv(){await action('导入清单',async()=>{const r=await api<{sites:Site[]}>('/import/csv',{text:csv.value});config.sites=r.sites;config.sourceId='';config.syncSheet=false;notice.value=`导入 ${r.sites.length} 个站点`})}
-async function fileCsv(e:Event){const f=(e.target as HTMLInputElement).files?.[0];if(!f)return;csv.value=await decodeCsvFile(f);await importCsv()}
+async function fileCsv(e:Event){
+  const input = e.target as HTMLInputElement
+  const f = input.files?.[0]
+  if (!f) return
+  csvFileName.value = f.name
+  csv.value = await decodeCsvFile(f)
+  await importCsv()
+}
+function clearCsvFile() {
+  csv.value = ''
+  csvFileName.value = ''
+  if (csvFileInput.value) csvFileInput.value.value = ''
+}
 async function decodeCsvFile(file:File){
   const bytes=new Uint8Array(await file.arrayBuffer())
   if(bytes.length>=3&&bytes[0]===0xEF&&bytes[1]===0xBB&&bytes[2]===0xBF)return new TextDecoder('utf-8').decode(bytes)
@@ -551,6 +587,16 @@ async function preview(){await action('生成执行计划',async()=>{config.chec
 async function start(){await action('开始部署',async()=>{if(!plan.value||!acknowledge.value)return;const r=await api<{id:string}>('/jobs',{planId:plan.value.id});job.value=await api<Job>(`/jobs/${r.id}`);step.value=5;plan.value=null})}
 async function stop(){if(job.value)await action('请求停止',async()=>{await api(`/jobs/${job.value!.id}/stop`,{});job.value!.stopRequested=true})}
 async function openJob(id:string){await action('读取任务',async()=>{job.value=await api<Job>(`/jobs/${id}`);step.value=5})}
+async function clearHistory(){
+  if (!history.value.length) return
+  if (!window.confirm(`确定清除全部 ${history.value.length} 条最近任务吗？`)) return
+  await action('清除任务', async () => {
+    await api('/history/clear', {})
+    history.value = []
+    if (job.value?.status !== 'running') job.value = null
+    notice.value = '已清除最近任务'
+  })
+}
 function retryFailed(){const domains=new Set(job.value?.results.filter(r=>r.status==='failed').map(r=>r.domain));config.sites.forEach(s=>s.selected=domains.has(s.domain));step.value=4;plan.value=null;notice.value='已选择失败站点。请先处理日志中的问题，再生成新的执行计划。'}
 function download(name:string,text:string){const url=URL.createObjectURL(new Blob(['\uFEFF'+text],{type:'text/plain;charset=utf-8'}));const a=document.createElement('a');a.href=url;a.download=name;a.click();URL.revokeObjectURL(url)}
 function exportResults(){const esc=(v:unknown)=>'"'+String(v??'').replace(/^[=+@-]/,"'$&").replaceAll('"','""')+'"';download('部署结果.csv',['domain,siteKey,Port,status,error',...(job.value?.results||[]).map(r=>[r.domain,r.siteKey,r.status==='deployed'?r.port:'',r.status,r.error].map(esc).join(','))].join('\r\n'))}
@@ -620,7 +666,7 @@ onUnmounted(()=>{
           <div class="card-heading"><div><span class="section-index">第 {{step+1}} 步</span><h2>{{steps[step]?.name}}</h2><p>{{steps[step]?.desc}}</p></div><span class="tag">{{step===5?'进行中':'向导'}}</span></div>
           <div class="step-brief tip"><span>{{step+1}}</span><p><strong>{{stepHelp.title}}</strong>{{stepHelp.body}}</p></div>
           <div v-if="step===0" class="card-body">
-            <label class="field-label">本地项目文件夹 <span>*</span></label><div class="input-action"><input id="project-path" :value="config.projectPath" :placeholder="pathPlaceholder" @input="onProjectPathInput"/><button v-if="isDesktop" class="button secondary" type="button" @click="pickProjectDir">选择文件夹</button><button class="button secondary" :disabled="!!busy||!config.projectPath" @click="inspect">{{busy==='识别项目'?'识别中…':'识别项目'}}</button></div><p class="field-help">选择或填写包含 <code>package.json</code> 的文件夹。推荐先点「识别项目」，系统会自动选好下面的选项。</p>
+            <label class="field-label">本地项目文件夹 <span>*</span></label><div class="input-action"><input id="project-path" :value="config.projectPath" :placeholder="pathPlaceholder" @input="onProjectPathInput"/><button v-if="isDesktop" class="button secondary" type="button" @click="pickProjectDir">选择文件夹</button><button v-if="config.projectPath" class="button secondary" type="button" @click="clearProjectPath">清除</button><button class="button secondary" :disabled="!!busy||!config.projectPath" @click="inspect">{{busy==='识别项目'?'识别中…':'识别项目'}}</button></div><p class="field-help">选择或填写包含 <code>package.json</code> 的文件夹。推荐先点「识别项目」，系统会自动选好下面的选项。</p>
             <div v-if="project" class="detected"><span class="check-circle">✓</span><div><strong>{{project.name}}</strong><p>{{project.detection || (project.label || project.framework.toUpperCase())}} · 发现 {{project.scripts.length}} 个脚本 · {{project.envKeys.length}} 个环境变量名</p></div><span class="tag green">已识别</span></div>
             <label class="field-label">你的项目用什么技术？</label><div class="framework-grid five"><button v-for="f in frameworkOptions" :key="f.id" :class="['framework',{selected:config.framework===f.id}]" @click="selectFramework(f.id)"><span :class="['framework-icon',f.id]">{{f.icon}}</span><strong>{{f.name}}</strong><small>{{f.hint}}</small><em class="framework-ssr">{{f.ssr}}</em><span class="radio-mark"></span></button></div>
             <label class="field-label">网站怎么跑在服务器上？</label><div class="mode-cards"><button type="button" :class="['mode-card',{chosen:config.mode==='static'}]" @click="selectMode('static')"><strong>静态网站</strong><span>把网页文件交给 Nginx 直接打开（多数前端项目选这个）</span></button><button type="button" :class="['mode-card',{chosen:config.mode==='node',disabled:modeLockedToStatic}]" :disabled="modeLockedToStatic" @click="selectMode('node')"><strong>动态网站（Node）</strong><span>{{modeLockedToStatic?'Vue / React 请改选 Nuxt / Next':'服务器跑 Node；Nginx 反向代理到该程序'}}</span></button></div>
@@ -646,7 +692,7 @@ onUnmounted(()=>{
           <div v-if="step===1" class="card-body">
             <div class="form-grid three"><label>服务器 IP 或主机名<input v-model="server.host" placeholder="例如 203.0.113.10"/><span class="field-help">云厂商控制台里的公网 IP</span></label><label>SSH 端口<input type="number" v-model="server.port"/><span class="field-help">默认 22，一般不用改</span></label><label>登录用户名<input v-model="server.username" placeholder="ubuntu"/><span class="field-help">常见：ubuntu / root</span></label></div>
             <label class="field-label">怎么登录服务器？</label><div class="segmented"><button v-for="a in [{id:'key',name:'SSH 私钥（推荐）'},{id:'password',name:'密码'}]" :key="a.id" :class="{chosen:server.auth===a.id}" @click="server.auth=a.id">{{a.name}}</button></div>
-            <template v-if="server.auth==='key'"><label>私钥文件路径<div class="input-action"><input :value="server.keyPath" :placeholder="keyPathPlaceholder" @input="onKeyPathInput"/><button v-if="isDesktop" class="button secondary" type="button" @click="pickKeyFile">选择文件</button></div><span class="field-help">从资源管理器复制路径时若带引号，会自动去掉。</span></label><label>私钥口令 <small>多数情况不用填</small><input v-model="server.passphrase" type="password" autocomplete="off" placeholder="只有加密过的私钥才需要"/></label></template>
+            <template v-if="server.auth==='key'"><label>私钥文件路径<div class="input-action"><input :value="server.keyPath" :placeholder="keyPathPlaceholder" @input="onKeyPathInput"/><button v-if="isDesktop" class="button secondary" type="button" @click="pickKeyFile">选择文件</button><button v-if="server.keyPath" class="button secondary" type="button" @click="clearKeyFile">删除</button></div><span class="field-help">从资源管理器复制路径时若带引号，会自动去掉。</span></label><label>私钥口令 <small>多数情况不用填</small><input v-model="server.passphrase" type="password" autocomplete="off" placeholder="只有加密过的私钥才需要"/></label></template>
             <label v-if="server.auth==='password'">SSH 密码<input v-model="server.password" type="password" autocomplete="off" placeholder="仅本次连接使用，不会写入草稿"/></label>
             <div class="tip"><span>◇</span><p><strong>按顺序点下面两个按钮。</strong>「指纹」是一串校验码，用来确认连对了机器。服务器建议 Ubuntu；静态网站需要 Nginx；动态网站还需要 Node 22+ 和 PM2；开 HTTPS 需要 Certbot。</p></div>
             <button class="button secondary" :disabled="!!busy||!server.host" @click="getFingerprint">{{busy==='读取指纹'?'正在读取…':'① 获取服务器指纹'}}</button><div v-if="fingerprint" class="fingerprint"><small>服务器指纹（SHA-256）</small><code>{{fingerprint}}</code><label class="check-row"><input type="checkbox" v-model="trusted"/><span>我已核对，这就是我的服务器</span></label></div><button class="button primary" :disabled="!!busy||!trusted" @click="connect">{{busy==='连接服务器'?'连接中…':'② 测试连接'}}</button>
@@ -663,8 +709,8 @@ onUnmounted(()=>{
           <div v-if="step===2" class="card-body">
             <div class="segmented"><button v-for="m in [{id:'manual',name:'手动添加一个'},{id:'csv',name:'用 CSV 批量导入'}]" :key="m.id" :class="{chosen:importMode===m.id}" @click="importMode=m.id">{{m.name}}</button></div>
             <div v-if="importMode==='manual'" class="manual-entry"><input v-model="newSite.domain" placeholder="域名，如 example.com" aria-label="新站点域名"/><input v-model="newSite.siteKey" placeholder="SITE_KEY（没有可留空）" aria-label="新站点SITE_KEY"/><button class="button secondary" @click="addSite">＋ 添加到清单</button></div>
-            <div v-if="importMode==='csv'"><div class="upload-box"><span>↥</span><strong>导入站点清单</strong><p>表格第一行要有「域名」列（也认 domain / 网站 / 网址 / host）。支持 Excel 另存的中文 CSV。</p><input type="file" accept=".csv,text/csv" @change="fileCsv" aria-label="选择CSV文件"/><button class="text-button" @click="download('站点模板.csv','序号,域名,siteKey,Port\n1,example.com,site-a,\n2,example.org,site-b,')">下载空白模板 ↗</button></div><details><summary>或者直接粘贴 CSV 文字</summary><textarea v-model="csv" rows="4" placeholder="序号,域名,siteKey,Port"/><button class="button secondary" :disabled="!!busy" @click="importCsv">导入这段内容</button></details></div>
-            <div class="list-toolbar"><strong>站点清单 <span>{{config.sites.length}}</span></strong><div><input type="number" v-model="range.from" aria-label="起始序号"/><span>至</span><input type="number" v-model="range.to" aria-label="结束序号"/><button class="text-button" @click="selectRange">按序号勾选</button></div></div>
+            <div v-if="importMode==='csv'"><div class="upload-box"><span>↥</span><strong>导入站点清单</strong><p>表格第一行要有「域名」列（也认 domain / 网站 / 网址 / host）。支持 Excel 另存的中文 CSV。</p><div class="csv-file-row"><input ref="csvFileInput" type="file" accept=".csv,text/csv" @change="fileCsv" aria-label="选择CSV文件"/><button v-if="csvFileName" class="button secondary" type="button" @click="clearCsvFile">删除文件</button></div><p v-if="csvFileName" class="field-help">已选：{{csvFileName}}</p><button class="text-button" @click="download('站点模板.csv','序号,域名,siteKey,Port\n1,example.com,site-a,\n2,example.org,site-b,')">下载空白模板 ↗</button></div><details><summary>或者直接粘贴 CSV 文字</summary><textarea v-model="csv" rows="4" placeholder="序号,域名,siteKey,Port"/><button class="button secondary" :disabled="!!busy" @click="importCsv">导入这段内容</button></details></div>
+            <div class="list-toolbar"><strong>站点清单 <span>{{config.sites.length}}</span></strong><div><input type="number" v-model="range.from" aria-label="起始序号"/><span>至</span><input type="number" v-model="range.to" aria-label="结束序号"/><button class="text-button" @click="selectRange">按序号勾选</button><button class="text-button" :disabled="!config.sites.length" @click="clearAllSites">全部清除</button></div></div>
             <div class="site-table"><table><thead><tr><th><input type="checkbox" :checked="!!config.sites.length&&selected.length===config.sites.length" @change="config.sites.forEach(s=>s.selected=($event.target as HTMLInputElement).checked)" aria-label="全选站点"/></th><th>序号</th><th>域名</th><th>SITE_KEY</th><th>内部端口</th><th></th></tr></thead><tbody><tr v-for="(s,i) in config.sites" :key="i"><td><input v-model="s.selected" type="checkbox" :aria-label="`选择 ${s.domain}`"/></td><td>{{s.seq}}</td><td><input v-model="s.domain" aria-label="域名"/></td><td><input v-model="s.siteKey" aria-label="SITE_KEY"/></td><td><input v-model="s.port" type="number" placeholder="自动" aria-label="Port"/></td><td><button class="remove" @click="config.sites.splice(i,1)" aria-label="移除站点">×</button></td></tr><tr v-if="!config.sites.length"><td colspan="6" class="empty-cell">还没有站点。先加一个域名，或导入清单。</td></tr></tbody></table></div><div class="table-footer">已勾选 <strong>{{selected.length}}</strong> 个站点 <span>「内部端口」仅动态网站需要；静态网站可留空。</span></div>
             <label class="check-row"><input type="checkbox" v-model="config.requireSiteKey"/><span>每个站点必须填写 SITE_KEY<small>多站点 / CMS 项目常开；普通一个域名的项目可关掉。</small></span></label>
           </div>
@@ -686,7 +732,7 @@ onUnmounted(()=>{
           </div>
           <div v-if="step===5" class="card-body">
             <template v-if="job"><div class="job-heading"><div><span :class="['tag',job.status==='complete'?'green':'']">{{statusLabel(job.status)}}</span><h3>{{job.current||'部署任务'}}</h3><p>{{job.phase}} · 已处理 {{job.results.length}} / {{job.total}} 个站点<span v-if="lastLogAt"> · 最近日志 {{lastLogAt}}</span></p></div><strong class="progress-number">{{progressHeadline}}<small v-if="showProgressPercent">%</small></strong></div><div class="progress-track"><div :style="{width:(job.status==='running' && !job.results.length ? 8 : progress)+'%'}"></div></div><div class="job-summary"><span><i class="dot green-dot"></i>{{successful}} 成功</span><span><i class="dot red-dot"></i>{{failed}} 失败</span><span>{{job.total-job.results.length}} 还在排队</span></div><div class="job-buttons"><button v-if="job.status==='running'" class="button secondary" :disabled="job.stopRequested||!!busy" @click="stop">{{job.stopRequested?'将在当前站完成后停止':'完成当前站后停止'}}</button><button v-if="failed&&job.status!=='running'" class="button secondary" @click="retryFailed">只重试失败的站点</button><button class="button secondary" @click="exportResults">导出结果 CSV</button><button class="text-button" @click="download('部署日志.txt',job!.logs.map(l=>l.time+' '+l.text).join('\n'))">下载日志</button></div><div class="terminal"><div class="terminal-bar"><span>● ● ●</span><b>部署日志</b><small>{{job.status==='running'?'进行中':'已结束'}}</small></div><div class="terminal-content" aria-live="polite"><p v-for="(l,i) in job.logs.slice(-100)" :key="i"><time>{{l.time.slice(11,19)}}</time><span>{{l.text}}</span></p><p v-if="!job.logs.length">正在准备任务…</p></div></div><div v-if="job.sheetStatus" class="tip">{{job.sheetStatus}}</div><div class="result-list"><div v-for="r in job.results" :key="r.domain"><span :class="['result-icon',r.status]">{{r.status==='deployed'?'✓':'!'}}</span><strong>{{r.domain}}</strong><span>{{r.status==='deployed'?(r.port||'静态'):'未完成'}}</span><small>{{r.error||'本站步骤已完成'}}</small></div></div></template>
-            <div v-else class="plan-empty"><div class="large-symbol">↗</div><h3>部署开始后，进度会出现在这里。</h3><p>完成前面的向导并确认执行后，可在此查看每个站点的进度与日志。</p><button class="button primary" @click="newDeploy">从头配置一次部署</button></div><div v-if="history.length" class="history"><h3>最近任务</h3><button v-for="h in history" :key="h.id" @click="openJob(h.id)"><span>{{new Date(h.createdAt).toLocaleString()}}</span><strong>{{h.total}} 个站点</strong><span>{{statusLabel(h.status)}} →</span></button></div>
+            <div v-else class="plan-empty"><div class="large-symbol">↗</div><h3>部署开始后，进度会出现在这里。</h3><p>完成前面的向导并确认执行后，可在此查看每个站点的进度与日志。</p><button class="button primary" @click="newDeploy">从头配置一次部署</button></div><div v-if="history.length" class="history"><div class="history-heading"><h3>最近任务</h3><button class="text-button" :disabled="!!busy||job?.status==='running'" @click="clearHistory">清除</button></div><button v-for="h in history" :key="h.id" @click="openJob(h.id)"><span>{{new Date(h.createdAt).toLocaleString()}}</span><strong>{{h.total}} 个站点</strong><span>{{statusLabel(h.status)}} →</span></button></div>
           </div>
           <footer v-if="step<4" class="card-footer"><button class="text-button" :disabled="step===0" @click="step--">← 上一步</button><span>现在只是在填表，还不会上线</span><button class="button primary" @click="goNext">{{step===3?'去预览计划':'下一步'}} →</button></footer>
         </section>

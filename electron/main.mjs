@@ -186,13 +186,14 @@ async function startApi() {
       }
     }
 
+    const detail = (lastError?.detail || apiLogs || '').trim().slice(-1200)
     const friendly =
       lastError?.code === 'EADDRINUSE' || lastError?.message === 'BUSY'
         ? '无法启动 DeployX：本机临时通道都被占用了。\n\n请完全退出所有 DeployX 窗口后重试；仍不行请重启电脑后再打开。'
         : lastError?.code === 'TIMEOUT'
           ? '启动超时。请再试一次；若刚关闭过 DeployX，请稍等几秒后再开。'
           : '无法启动本地服务。请重新打开 DeployX；仍不行请重启电脑后再试。'
-    throw new Error(friendly)
+    throw new Error(detail ? `${friendly}\n\n详情：\n${detail}` : friendly)
   } finally {
     startingApi = false
   }

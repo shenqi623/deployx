@@ -171,7 +171,16 @@ const server = http.createServer(async (req, res) => {
         execute(j,c,connection.credentials,source).catch(()=>{})
         return json(res,202,{id:j.id})
       }
-      if (url.pathname === '/api/history') return json(res,200,history.map(j=>({...j,logs:undefined})))
+      if (url.pathname === '/api/history' && req.method === 'GET') return json(res,200,history.map(j=>({...j,logs:undefined})))
+      if (url.pathname === '/api/history/clear' && req.method === 'POST') {
+        assert(!activeJob, '部署进行中，请先等待完成或停止后再清除')
+        history = []
+        const temp = path.join(dataDir, 'history.tmp')
+        await writeFile(temp, '[]', { mode: 0o600 })
+        await rename(temp, path.join(dataDir, 'history.json'))
+        return json(res,200,{ ok:true })
+      }
+      if (url.pathname === '/api/history') return json(res,404,{error:'接口不存在'})
       if (url.pathname.startsWith('/api/jobs/')) {
         const id = url.pathname.split('/')[3], job = jobs.get(id) || history.find(j=>j.id===id)
         assert(job,'任务不存在')

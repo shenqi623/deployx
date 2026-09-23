@@ -7,7 +7,7 @@ export async function connect(server, discover = false) {
   assert(typeof server.host === 'string' && /^[A-Za-z0-9.:-]+$/.test(server.host), '服务器地址无效')
   assert(/^[a-zA-Z_][a-zA-Z0-9_-]*$/.test(server.username), 'SSH 用户名无效')
   assert(Number.isInteger(Number(server.port)) && Number(server.port) > 0 && Number(server.port) <= 65535, 'SSH 端口无效')
-  const config = { host: server.host, port: Number(server.port), username: server.username, readyTimeout: 20000, keepaliveInterval: 15000, hostHash: 'sha256' }
+  const config = { host: server.host, port: Number(server.port), username: server.username, readyTimeout: 45000, keepaliveInterval: 10000, keepaliveCountMax: 6, hostHash: 'sha256' }
   if (!discover) {
     assert(/^[a-f0-9]{64}$/.test(server.fingerprint || ''), '先获取并确认服务器指纹')
     if (server.auth === 'key') { config.privateKey = await readFile(unwrapPath(server.keyPath)); config.passphrase = server.passphrase || undefined }
@@ -21,7 +21,16 @@ export async function connect(server, discover = false) {
     client.once('ready', () => resolve(client))
     client.on('error', error => {
       if (discover && fingerprint) { client.end(); resolve(fingerprint); return }
-      reject(new Error(fingerprint && fingerprint !== server.fingerprint ? '服务器指纹不一致，连接已停止，请核实服务器身份' : `SSH 连接失败：${error.message}`))
+      if (fingerprint && fingerprint !== server.fingerprint) {
+        reject(new Error('服务器指纹不一致，连接已停止，请核实服务器身份'))
+        return
+      }
+      const raw = String(error?.message || error || '')
+      let tip = `SSH 连接失败：${raw}`
+      if (/Timed out|ETIMEDOUT|timeout/i.test(raw)) tip = 'SSH 连接超时。请检查服务器是否开机、安全组是否放行 22 端口，以及本机网络是否稳定后重试。'
+      else if (/ECONNRESET|ECONNREFUSED|ENETUNREACH|EHOSTUNREACH/i.test(raw)) tip = '无法连上服务器。请确认 IP/端口正确，服务器防火墙已放行，并稍后再试。'
+      else if (/All configured authentication methods failed|Authentication failure/i.test(raw)) tip = 'SSH 认证失败。请核对用户名、私钥或密码是否正确。'
+      reject(new Error(tip))
     })
     client.connect(config)
   })
