@@ -10,11 +10,30 @@ export async function connect(server, discover = false) {
   const config = { host: server.host, port: Number(server.port), username: server.username, readyTimeout: 45000, keepaliveInterval: 10000, keepaliveCountMax: 6, hostHash: 'sha256' }
   if (!discover) {
     assert(/^[a-f0-9]{64}$/.test(server.fingerprint || ''), '先获取并确认服务器指纹')
-    if (server.auth === 'key') { config.privateKey = await readFile(unwrapPath(server.keyPath)); config.passphrase = server.passphrase || undefined }
+    if (server.auth === 'key') {
+      assert(server.keyPath, '请选择 SSH 私钥文件')
+      try { config.privateKey = await readFile(unwrapPath(server.keyPath)) }
+      catch { throw new Error(`找不到私钥文件：${server.keyPath}`) }
+      config.passphrase = server.passphrase || undefined
+    }
     else if (server.auth === 'password') { assert(server.password, '请输入 SSH 密码'); config.password = server.password }
     else if (server.auth === 'agent') { config.agent = server.agent || process.env.SSH_AUTH_SOCK || (process.platform === 'win32' ? '\\\\.\\pipe\\openssh-ssh-agent' : undefined); assert(config.agent, '未找到 SSH Agent，请填写 socket 路径') }
     else throw new Error('认证方式无效')
   }
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await connectOnce(config, server, discover)
+    } catch (error) {
+      if (!TRANSIENT.test(error.raw || '') || attempt >= CONNECT_ATTEMPTS) throw error
+      await new Promise(r => setTimeout(r, attempt * 1500))
+    }
+  }
+}
+
+const CONNECT_ATTEMPTS = 3
+const TRANSIENT = /before handshake|ECONNRESET|Timed out|ETIMEDOUT|timeout|socket hang up|EPIPE/i
+
+function connectOnce(config, server, discover) {
   return new Promise((resolve, reject) => {
     const client = new Client(); let fingerprint
     config.hostVerifier = hash => { fingerprint = hash; return !discover && hash === server.fingerprint }
@@ -26,13 +45,10 @@ export async function connect(server, discover = false) {
         return
       }
       const raw = String(error?.message || error || '')
-      let tip = `SSH 连接失败：${raw}`
-      if (/Timed out|ETIMEDOUT|timeout/i.test(raw)) tip = 'SSH 连接超时。请检查服务器是否开机、安全组是否放行 22 端口，以及本机网络是否稳定后重试。'
-      else if (/ECONNRESET|ECONNREFUSED|ENETUNREACH|EHOSTUNREACH/i.test(raw)) tip = '无法连上服务器。请确认 IP/端口正确，服务器防火墙已放行，并稍后再试。'
-      else if (/All configured authentication methods failed|Authentication failure/i.test(raw)) tip = 'SSH 认证失败。请核对用户名、私钥或密码是否正确。'
-      reject(new Error(tip))
+      reject(Object.assign(new Error(`SSH 连接失败：${raw}`), { raw }))
     })
-    client.connect(config)
+    try { client.connect(config) }
+    catch (error) { reject(Object.assign(new Error(`SSH 连接失败：${error.message}`), { raw: String(error.message) })) }
   })
 }
 export function remote(client, command, onData = () => {}, timeout = 900000) {
@@ -47,7 +63,7 @@ export function remote(client, command, onData = () => {}, timeout = 900000) {
       const data = b => { const s = b.toString(); output = (output + s).slice(-100000); onData(s) }
       stream.on('data', data); stream.stderr.on('data', data)
       stream.once('error', finish)
-      stream.once('close', code => finish(code === 0 ? null : new Error(`远程命令退出码 ${code}：${output.slice(-1500)}`)))
+      stream.once('close', code => finish(code === 0 ? null : Object.assign(new Error(`远程命令退出码 ${code}：${output.slice(-1500)}`), { raw: output.slice(-3000) })))
     })
   })
 }

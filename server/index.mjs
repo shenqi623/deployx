@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto'
 import { applySystemProxy } from './proxy.mjs'
 import { assert, inspectProject, parseCsv, sitesFromRows, validateConfig, redact, assertDeployShape } from './core.mjs'
 import { connect, remote } from './ssh.mjs'
+import { explainError, formatExplanation } from './errors.mjs'
 import { deploySite } from './deploy.mjs'
 import { loadSheet, writePorts } from './sheets.mjs'
 import { PROBE_COMMAND, buildInstallScript, parseReport, requirementsFromReport } from './bootstrap.mjs'
@@ -28,13 +29,19 @@ function getConnection(id) { const s = connections.get(id); assert(s && s.expire
 function publicJob(j) { return { id: j.id, createdAt: j.createdAt, status: j.status, phase: j.phase, total: j.total, current: j.current, results: j.results, logs: j.logs, stopRequested: j.stopRequested, sheetStatus: j.sheetStatus } }
 async function save(j) { history = [publicJob(j), ...history.filter(x => x.id !== j.id)].slice(0,30); const temp=path.join(dataDir,'history.tmp'); await writeFile(temp, JSON.stringify(history), { mode: 0o600 }); await rename(temp,path.join(dataDir,'history.json')) }
 async function execute(j, c, credentials, source) {
+  const secrets = [credentials.password, credentials.passphrase, ...Object.values(c.env)]
   try {
     await save(j)
     for (const site of c.sites) {
       if (j.stopRequested) break
       j.current = site.domain
       try { j.results.push(await deploySite(c, site, credentials, j, dataDir)) }
-      catch(e) { j.log(`失败：${redact(e.message, [credentials.password, credentials.passphrase, ...Object.values(c.env)])}\n`); j.results.push({ domain: site.domain, siteKey: site.siteKey, port: site.port, sourceRow: site.sourceRow, status: 'failed', error: redact(e.message, [credentials.password, credentials.passphrase, ...Object.values(c.env)] ) }); if (!c.continueOnError) break }
+      catch(e) {
+        const detail = explainError(e, secrets)
+        j.log(`\n${site.domain} 部署失败\n${formatExplanation(detail)}`)
+        j.results.push({ domain: site.domain, siteKey: site.siteKey, port: site.port, sourceRow: site.sourceRow, status: 'failed', error: detail.title, detail })
+        if (!c.continueOnError) break
+      }
       await save(j)
     }
     if (source && c.syncSheet) {
@@ -43,7 +50,7 @@ async function execute(j, c, credentials, source) {
       catch(e) { j.sheetStatus = `回填失败：${e.message}；可导出 CSV 手动回填`; j.log(j.sheetStatus) }
     }
     j.status = j.stopRequested ? 'stopped' : j.results.some(r => r.status === 'failed') ? 'partial' : 'complete'
-  } catch(e) { j.status = 'failed'; j.log(redact(e.message, [credentials.password, credentials.passphrase, ...Object.values(c.env)])) }
+  } catch(e) { j.status = 'failed'; j.log(formatExplanation(explainError(e, secrets))) }
   finally { j.phase = '结束'; activeJob = null; await save(j) }
 }
 async function body(req) {
@@ -63,6 +70,10 @@ function friendlyError(error) {
     return '这个目录不是可识别的前端项目，请选择包含 package.json 的目录。'
   }
   return redact(message)
+}
+function errorBody(error, secrets = []) {
+  const detail = explainError({ message: friendlyError(error), raw: error?.raw }, secrets)
+  return { error: detail.title, detail }
 }
 async function readDraft() {
   try {
@@ -102,7 +113,7 @@ const server = http.createServer(async (req, res) => {
       }
       if (url.pathname === '/api/project' && req.method === 'POST') {
         try { return json(res,200,await inspectProject(b.path)) }
-        catch (e) { return json(res,400,{ error: friendlyError(e) }) }
+        catch (e) { return json(res,400,errorBody(e)) }
       }
       if (url.pathname === '/api/import/csv' && req.method === 'POST') return json(res,200,sitesFromRows(parseCsv(b.text)))
       if (url.pathname === '/api/import/sheets' && req.method === 'POST') { const parsed = await loadSheet(b); const id = randomUUID(); sources.set(id,b); return json(res,200,{...parsed,sourceId:id}) }
@@ -197,7 +208,7 @@ const server = http.createServer(async (req, res) => {
     const types={'.html':'text/html; charset=utf-8','.js':'text/javascript','.css':'text/css','.svg':'image/svg+xml','.ico':'image/x-icon'}
     try { const bytes=await readFile(file); res.writeHead(200,{'Content-Type':types[path.extname(file)]||'application/octet-stream','X-Content-Type-Options':'nosniff'}); res.end(bytes) }
     catch { if(!res.headersSent)res.writeHead(404); res.end('请先运行 pnpm build，或使用 pnpm dev 启动开发界面。') }
-  } catch(e) { if(!res.headersSent)json(res,400,{error:friendlyError(e)}); else res.end() }
+  } catch(e) { if(!res.headersSent)json(res,400,errorBody(e)); else res.end() }
 })
 server.on('error', err => {
   if (err && err.code === 'EADDRINUSE') {

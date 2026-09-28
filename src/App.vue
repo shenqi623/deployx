@@ -2,7 +2,8 @@
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import './style.css'
 type Site = { seq: string; domain: string; siteKey: string; port: number | null; selected: boolean; sourceRow?: number }
-type Result = { domain: string; siteKey: string; port: number | null; status: string; error?: string }
+type ErrorDetail = { title: string; reasons: string[]; steps: string[]; raw: string }
+type Result = { domain: string; siteKey: string; port: number | null; status: string; error?: string; detail?: ErrorDetail }
 type Job = { id: string; createdAt: string; status: string; phase: string; total: number; current: string; results: Result[]; logs: {time:string;text:string}[]; stopRequested?: boolean; sheetStatus?: string }
 type Plan = { id: string; sites: Site[]; steps: string[]; notes: string[]; mode: string; baseDir: string; validation: string; https: boolean }
 type Project = { name: string; framework: string; label?: string; mode: string; output: string; entry: string; spa: boolean; scripts: string[]; envKeys: string[]; adapter: boolean; requireSiteKey?: boolean; buildScript?: string; detection?: string; nextSsr?: boolean; nuxtSsr?: boolean; outputMode?: string; runtimeInstall?: boolean; runner?: string }
@@ -147,13 +148,40 @@ const overviewModeLabel = computed(() => config.mode === 'node'
   ? '动态网站（Node + Nginx 反向代理）'
   : '静态网站（Nginx 直接托管）')
 const step = ref(0), online = ref(false), busy = ref(''), error = ref(''), notice = ref('')
+const errorDetail = ref<ErrorDetail | null>(null), copiedError = ref(false)
 let errorTimer: ReturnType<typeof setTimeout> | undefined
 let noticeTimer: ReturnType<typeof setTimeout> | undefined
 watch(error, value => {
   clearTimeout(errorTimer)
-  if (!value) return
+  if (!value) { errorDetail.value = null; return }
+  if (errorDetail.value) return
   errorTimer = setTimeout(() => { error.value = '' }, 2500)
 })
+function showError(e: unknown) {
+  const detail = (e as { detail?: ErrorDetail })?.detail
+  const message = e instanceof Error ? e.message : String(e)
+  errorDetail.value = detail && (detail.reasons.length || detail.steps.length || detail.raw) ? detail : null
+  copiedError.value = false
+  error.value = detail?.title || message
+  clearTimeout(errorTimer)
+  if (!errorDetail.value) errorTimer = setTimeout(() => { error.value = '' }, 2500)
+}
+function closeError() {
+  error.value = ''
+}
+function errorText(d: ErrorDetail) {
+  return [
+    `问题：${d.title}`,
+    ...(d.reasons.length ? ['可能原因：', ...d.reasons.map(r => `- ${r}`)] : []),
+    ...(d.steps.length ? ['怎么解决：', ...d.steps.map((s, i) => `${i + 1}. ${s}`)] : []),
+    ...(d.raw ? ['原始错误信息：', d.raw] : []),
+  ].join('\n')
+}
+async function copyError() {
+  if (!errorDetail.value) return
+  try { await navigator.clipboard.writeText(errorText(errorDetail.value)); copiedError.value = true }
+  catch { download('错误信息.txt', errorText(errorDetail.value)) }
+}
 watch(notice, value => {
   clearTimeout(noticeTimer)
   if (!value) return
@@ -285,12 +313,12 @@ async function api<T>(url:string,data?:unknown):Promise<T>{
       ? '部署服务已断开。请重新打开 DeployX；若刚关闭过，请稍等几秒再试。'
       : '无法连接本地服务。请确认本地服务已启动。')
   }
-  let body: { error?: string } = {}
+  let body: { error?: string; detail?: ErrorDetail } = {}
   try { body = await response.json() } catch { /* non-json */ }
   if (!response.ok) {
     const message = body.error || `请求失败（HTTP ${response.status}）`
     if (/连接会话已过期/.test(message)) clearConnection('连接会话已失效，请重新连接服务器。')
-    throw new Error(message)
+    throw Object.assign(new Error(message), { detail: body.detail })
   }
   return body as T
 }
@@ -316,7 +344,7 @@ function syncServerEpoch(startedAt?: string) {
   if (previous && previous !== startedAt && connected.value) clearConnection('本地服务已重启，SSH 会话已清空。请重新测试连接。')
   sessionStorage.setItem('deployx-server-started-at', startedAt)
 }
-async function action(name:string,fn:()=>Promise<void>){busy.value=name;error.value='';notice.value='';try{await fn()}catch(e){error.value=e instanceof Error?e.message:String(e)}finally{busy.value=''}}
+async function action(name:string,fn:()=>Promise<void>){busy.value=name;error.value='';notice.value='';try{await fn()}catch(e){showError(e)}finally{busy.value=''}}
 function selectFramework(f:string){
   const preset = presetMap[f] ?? {
     mode: 'static', output: 'dist', entry: '', spa: true, requireSiteKey: false, buildScript: 'build', runner: 'static',
@@ -621,13 +649,22 @@ onUnmounted(()=>{
   <Teleport to="body">
     <div class="deployx-flash" aria-live="polite">
       <Transition name="flash-fade">
+        <div v-if="error && errorDetail" class="error-panel" role="alert">
+          <div class="error-panel-head"><span class="error-panel-icon">!</span><strong>{{errorDetail.title}}</strong><button class="error-panel-close" aria-label="关闭" @click="closeError">×</button></div>
+          <div class="error-panel-body">
+            <template v-if="errorDetail.reasons.length"><h4>可能原因</h4><ul><li v-for="r in errorDetail.reasons" :key="r">{{r}}</li></ul></template>
+            <template v-if="errorDetail.steps.length"><h4>怎么解决</h4><ol><li v-for="s in errorDetail.steps" :key="s">{{s}}</li></ol></template>
+            <details v-if="errorDetail.raw"><summary>原始错误信息（给技术人员看）</summary><pre>{{errorDetail.raw}}</pre></details>
+          </div>
+          <div class="error-panel-actions"><button class="button small secondary" @click="copyError">{{copiedError?'已复制':'复制错误信息'}}</button><button class="button small secondary" @click="closeError">我知道了</button></div>
+        </div>
         <el-alert
-          v-if="error"
+          v-else-if="error"
           type="error"
           show-icon
           :closable="true"
           :title="error"
-          @close="error=''"
+          @close="closeError"
         />
       </Transition>
       <Transition name="flash-fade">
@@ -731,7 +768,7 @@ onUnmounted(()=>{
             <template v-else><div class="plan-stats"><div><strong>{{plan.sites.length}}</strong><span>待部署站点</span></div><div><strong>{{plan.https?'HTTPS':'HTTP'}}</strong><span>访问协议</span></div><div><strong>{{plan.mode==='node'?'动态 · Node':'静态 · Nginx'}}</strong><span>运行方式</span></div></div><div class="pipeline"><span v-for="(s,i) in plan.steps" :key="s"><i>{{i+1}}</i>{{s}}</span></div><div class="site-table"><table><thead><tr><th>域名</th><th>内部端口</th><th>服务器目录</th></tr></thead><tbody><tr v-for="s in plan.sites" :key="s.domain"><td>{{s.domain}}</td><td>{{s.port||'静态（无端口）'}}</td><td class="mono">{{plan.baseDir}}/{{s.domain.replaceAll('.','-')}}</td></tr></tbody></table></div><div class="tip"><span>i</span><div><p v-for="n in plan.notes" :key="n">{{n}}</p><p v-if="plan.https">开始部署即表示同意为这些域名申请证书，并接受 <a href="https://letsencrypt.org/repository/" target="_blank" rel="noopener">Let's Encrypt 服务条款</a>。</p></div></div><label class="check-row"><input v-model="acknowledge" type="checkbox"/><span>我已确认服务器、域名范围和设置，可以开始真正部署。</span></label><button class="button primary full" :disabled="!acknowledge||!!busy||job?.status==='running'" @click="start">开始部署 {{plan.sites.length}} 个站点 ↗</button></template>
           </div>
           <div v-if="step===5" class="card-body">
-            <template v-if="job"><div class="job-heading"><div><span :class="['tag',job.status==='complete'?'green':'']">{{statusLabel(job.status)}}</span><h3>{{job.current||'部署任务'}}</h3><p>{{job.phase}} · 已处理 {{job.results.length}} / {{job.total}} 个站点<span v-if="lastLogAt"> · 最近日志 {{lastLogAt}}</span></p></div><strong class="progress-number">{{progressHeadline}}<small v-if="showProgressPercent">%</small></strong></div><div class="progress-track"><div :style="{width:(job.status==='running' && !job.results.length ? 8 : progress)+'%'}"></div></div><div class="job-summary"><span><i class="dot green-dot"></i>{{successful}} 成功</span><span><i class="dot red-dot"></i>{{failed}} 失败</span><span>{{job.total-job.results.length}} 还在排队</span></div><div class="job-buttons"><button v-if="job.status==='running'" class="button secondary" :disabled="job.stopRequested||!!busy" @click="stop">{{job.stopRequested?'将在当前站完成后停止':'完成当前站后停止'}}</button><button v-if="failed&&job.status!=='running'" class="button secondary" @click="retryFailed">只重试失败的站点</button><button class="button secondary" @click="exportResults">导出结果 CSV</button><button class="text-button" @click="download('部署日志.txt',job!.logs.map(l=>l.time+' '+l.text).join('\n'))">下载日志</button></div><div class="terminal"><div class="terminal-bar"><span>● ● ●</span><b>部署日志</b><small>{{job.status==='running'?'进行中':'已结束'}}</small></div><div class="terminal-content" aria-live="polite"><p v-for="(l,i) in job.logs.slice(-100)" :key="i"><time>{{l.time.slice(11,19)}}</time><span>{{l.text}}</span></p><p v-if="!job.logs.length">正在准备任务…</p></div></div><div v-if="job.sheetStatus" class="tip">{{job.sheetStatus}}</div><div class="result-list"><div v-for="r in job.results" :key="r.domain"><span :class="['result-icon',r.status]">{{r.status==='deployed'?'✓':'!'}}</span><strong>{{r.domain}}</strong><span>{{r.status==='deployed'?(r.port||'静态'):'未完成'}}</span><small>{{r.error||'本站步骤已完成'}}</small></div></div></template>
+            <template v-if="job"><div class="job-heading"><div><span :class="['tag',job.status==='complete'?'green':'']">{{statusLabel(job.status)}}</span><h3>{{job.current||'部署任务'}}</h3><p>{{job.phase}} · 已处理 {{job.results.length}} / {{job.total}} 个站点<span v-if="lastLogAt"> · 最近日志 {{lastLogAt}}</span></p></div><strong class="progress-number">{{progressHeadline}}<small v-if="showProgressPercent">%</small></strong></div><div class="progress-track"><div :style="{width:(job.status==='running' && !job.results.length ? 8 : progress)+'%'}"></div></div><div class="job-summary"><span><i class="dot green-dot"></i>{{successful}} 成功</span><span><i class="dot red-dot"></i>{{failed}} 失败</span><span>{{job.total-job.results.length}} 还在排队</span></div><div class="job-buttons"><button v-if="job.status==='running'" class="button secondary" :disabled="job.stopRequested||!!busy" @click="stop">{{job.stopRequested?'将在当前站完成后停止':'完成当前站后停止'}}</button><button v-if="failed&&job.status!=='running'" class="button secondary" @click="retryFailed">只重试失败的站点</button><button class="button secondary" @click="exportResults">导出结果 CSV</button><button class="text-button" @click="download('部署日志.txt',job!.logs.map(l=>l.time+' '+l.text).join('\n'))">下载日志</button></div><div class="terminal"><div class="terminal-bar"><span>● ● ●</span><b>部署日志</b><small>{{job.status==='running'?'进行中':'已结束'}}</small></div><div class="terminal-content" aria-live="polite"><p v-for="(l,i) in job.logs.slice(-100)" :key="i"><time>{{l.time.slice(11,19)}}</time><span>{{l.text}}</span></p><p v-if="!job.logs.length">正在准备任务…</p></div></div><div v-if="job.sheetStatus" class="tip">{{job.sheetStatus}}</div><div class="result-list"><div v-for="r in job.results" :key="r.domain"><span :class="['result-icon',r.status]">{{r.status==='deployed'?'✓':'!'}}</span><strong>{{r.domain}}</strong><span>{{r.status==='deployed'?(r.port||'静态'):'未完成'}}</span><small>{{r.error||'本站步骤已完成'}}</small><div v-if="r.detail && (r.detail.reasons.length || r.detail.steps.length)" class="result-detail"><template v-if="r.detail.reasons.length"><h4>可能原因</h4><ul><li v-for="x in r.detail.reasons" :key="x">{{x}}</li></ul></template><template v-if="r.detail.steps.length"><h4>怎么解决</h4><ol><li v-for="x in r.detail.steps" :key="x">{{x}}</li></ol></template></div></div></div></template>
             <div v-else class="plan-empty"><div class="large-symbol">↗</div><h3>部署开始后，进度会出现在这里。</h3><p>完成前面的向导并确认执行后，可在此查看每个站点的进度与日志。</p><button class="button primary" @click="newDeploy">从头配置一次部署</button></div><div v-if="history.length" class="history"><div class="history-heading"><h3>最近任务</h3><button class="text-button" :disabled="!!busy||job?.status==='running'" @click="clearHistory">清除</button></div><button v-for="h in history" :key="h.id" @click="openJob(h.id)"><span>{{new Date(h.createdAt).toLocaleString()}}</span><strong>{{h.total}} 个站点</strong><span>{{statusLabel(h.status)}} →</span></button></div>
           </div>
           <footer v-if="step<4" class="card-footer"><button class="text-button" :disabled="step===0" @click="step--">← 上一步</button><span>现在只是在填表，还不会上线</span><button class="button primary" @click="goNext">{{step===3?'去预览计划':'下一步'}} →</button></footer>

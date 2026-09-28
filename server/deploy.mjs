@@ -8,10 +8,12 @@ import { connect, remote, upload } from './ssh.mjs'
 export function run(file, args, options = {}, log = () => {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(file, args, { ...options, windowsHide: true, stdio: ['ignore','pipe','pipe'] })
-    const timer = setTimeout(() => { child.kill(); reject(new Error('本地命令执行超时')) }, 20 * 60 * 1000)
-    child.stdout.on('data', b => log(b.toString())); child.stderr.on('data', b => log(b.toString()))
+    let tail = ''
+    const collect = b => { const s = b.toString(); tail = (tail + s).slice(-3000); log(s) }
+    const timer = setTimeout(() => { child.kill(); reject(Object.assign(new Error('本地命令执行超时'), { raw: tail })) }, 20 * 60 * 1000)
+    child.stdout.on('data', collect); child.stderr.on('data', collect)
     child.on('error', e => { clearTimeout(timer); reject(e) })
-    child.on('close', code => { clearTimeout(timer); code === 0 ? resolve() : reject(new Error(`本地命令退出码 ${code}`)) })
+    child.on('close', code => { clearTimeout(timer); code === 0 ? resolve() : reject(Object.assign(new Error(`本地命令退出码 ${code}`), { raw: `本地命令退出码 ${code}\n${tail}` })) })
   })
 }
 async function safeOutput(directory) {
@@ -221,6 +223,6 @@ export async function deploySite(c, site, credentials, job, dataDir) {
       }
     }
     return { domain: site.domain, port: site.port, siteKey: site.siteKey, sourceRow: site.sourceRow, status: 'deployed', release }
-  } catch(e) { throw new Error(redact(e.message, secrets)) }
+  } catch(e) { throw Object.assign(new Error(redact(e.message, secrets)), e.raw ? { raw: redact(e.raw, secrets) } : {}) }
   finally { if(pending)job.log(redact(pending,secrets)); client?.end(); await rm(stage, { recursive: true, force: true }); await rm(archive, { force: true }) }
 }
