@@ -67,9 +67,32 @@ export function remote(client, command, onData = () => {}, timeout = 900000) {
     })
   })
 }
-export function upload(client, local, destination) {
-  return new Promise((resolve, reject) => client.sftp((e, sftp) => {
-    if (e) return reject(e)
-    sftp.fastPut(local, destination, { mode: 0o600 }, error => { sftp.end(); error ? reject(error) : resolve() })
-  }))
+const UPLOAD_STALL_MS = 60000
+
+export function upload(client, local, destination, onProgress = () => {}) {
+  return new Promise((resolve, reject) => {
+    let done = false, sftp, lastMove = Date.now()
+    const finish = error => {
+      if (done) return
+      done = true
+      clearInterval(watchdog)
+      client.off('close', closed)
+      try { sftp?.end() } catch {}
+      if (error) { client.end(); reject(error) } else resolve()
+    }
+    const closed = () => finish(Object.assign(new Error('上传时 SSH 连接中断'), { raw: 'ECONNRESET during upload' }))
+    const watchdog = setInterval(() => {
+      if (Date.now() - lastMove > UPLOAD_STALL_MS) finish(Object.assign(new Error('上传卡住：60 秒没有任何进度'), { raw: 'upload stalled' }))
+    }, 5000)
+    client.once('close', closed)
+    client.sftp((e, s) => {
+      if (e) return finish(e)
+      sftp = s
+      sftp.once('error', finish)
+      sftp.fastPut(local, destination, {
+        mode: 0o600,
+        step: (transferred, _chunk, total) => { lastMove = Date.now(); onProgress(transferred, total) },
+      }, error => finish(error || null))
+    })
+  })
 }

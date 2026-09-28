@@ -16,6 +16,8 @@ export function run(file, args, options = {}, log = () => {}) {
     child.on('close', code => { clearTimeout(timer); code === 0 ? resolve() : reject(Object.assign(new Error(`本地命令退出码 ${code}`), { raw: `本地命令退出码 ${code}\n${tail}` })) })
   })
 }
+const UPLOAD_ATTEMPTS = 3
+
 async function safeOutput(directory) {
   for (const entry of await readdir(directory, { withFileTypes: true })) {
     assert(!entry.isSymbolicLink(), '构建产物包含符号链接；请先生成可独立部署的产物')
@@ -72,6 +74,32 @@ export function buildEcosystem(c, site, target, name) {
   }
 }
 
+export function siteProbe(baseDir, site, nginxDir = '/etc/nginx/sites-available') {
+  const root = q(`${baseDir}/${site.slug}`), nginx = q(`${nginxDir}/lp-${site.slug}`)
+  return `r=${root}; n=${nginx}; printf 'DX_SITE %s ' ${q(site.domain)}
+if [ -f "$r/.deployx-owned" ] || [ -f "$r/.launchpad-owned" ]; then
+m=$(cat "$r/.deployx-mode" 2>/dev/null || cat "$r/.launchpad-mode" 2>/dev/null || echo unknown)
+p=$(cat "$r/.deployx-port" 2>/dev/null || cat "$r/.launchpad-port" 2>/dev/null || echo -)
+t=$(stat -c %Y "$(readlink -f "$r/current")" 2>/dev/null || echo -)
+printf 'managed %s %s %s' "$m" "$p" "$t"
+elif [ -e "$r" ]; then printf 'foreign'
+elif [ -e "$n" ]; then printf 'nginx-elsewhere %s' "$(grep -m1 -oE '(root|proxy_pass) [^;]+' "$n" 2>/dev/null | tr ' ' '|')"
+else printf 'new'; fi; printf '\\n'`
+}
+
+export function parseSiteProbe(output) {
+  const map = new Map()
+  for (const m of output.matchAll(/^DX_SITE (\S+) (managed|foreign|nginx-elsewhere|new)(?: (.*))?$/gm)) {
+    const [, domain, status, rest = ''] = m
+    if (status === 'managed') {
+      const [mode, port, time] = rest.trim().split(' ')
+      map.set(domain, { status, mode, port: /^\d+$/.test(port) ? Number(port) : null, deployedAt: /^\d+$/.test(time) ? new Date(Number(time) * 1000).toISOString() : null })
+    } else if (status === 'nginx-elsewhere') map.set(domain, { status, target: rest.replaceAll('|', ' ').trim() })
+    else map.set(domain, { status })
+  }
+  return map
+}
+
 export function remoteScript(c, site, release, archive, env) {
   const root = `${c.baseDir}/${site.slug}`, target = `${root}/releases/${release}`, name = `lp-${site.slug}`
   const config = `/etc/nginx/sites-available/${name}`
@@ -79,6 +107,7 @@ export function remoteScript(c, site, release, archive, env) {
   const nginx = `server {\n listen 80;\n listen [::]:80;\n server_name ${site.domain};\n${c.mode === 'node' ? ` location / {\n  proxy_pass http://127.0.0.1:${site.port};\n  proxy_http_version 1.1;\n  proxy_set_header Host $host;\n  proxy_set_header X-Real-IP $remote_addr;\n  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n  proxy_set_header X-Forwarded-Proto $scheme;\n }` : ` root ${root}/current/${c.output};\n index index.html;\n location / { try_files $uri $uri/ ${c.spa ? '/index.html' : '=404'}; }`}\n}\n`
   const b64 = s => Buffer.from(s).toString('base64')
   const needsInstall = !!(c.runtimeInstall && c.mode === 'node') || (c.framework === 'next' && c.mode === 'node')
+  const allowSwitch = (c.allowModeSwitch || []).includes(site.domain)
   return `set -eu
 root=${q(root)}
 target=${q(target)}
@@ -91,7 +120,14 @@ test ! -L "$root" || { echo '站点目录不能是符号链接'; exit 21; }
 domain_file="$root/.deployx-domain"; [ -f "$domain_file" ] || domain_file="$root/.launchpad-domain"
 if [ -f "$domain_file" ]; then test "$(cat "$domain_file")" = ${q(site.domain)} || { echo '部署目录已由另一个域名使用'; exit 21; }; fi
 mode_file="$root/.deployx-mode"; [ -f "$mode_file" ] || mode_file="$root/.launchpad-mode"
-if [ -f "$mode_file" ]; then test "$(cat "$mode_file")" = ${q(c.mode)} || { echo '已有站点不能直接切换静态/Node模式，请使用新部署根目录'; exit 22; }; fi
+old_mode=''
+switching=0
+if [ -f "$mode_file" ]; then old_mode=$(cat "$mode_file"); fi
+if [ -n "$old_mode" ] && [ "$old_mode" != ${q(c.mode)} ]; then
+${allowSwitch ? ` switching=1
+ echo "部署方式切换：$old_mode → ${c.mode}（用户已在执行计划中确认）"` : ` echo "该站点之前是 $old_mode 部署，本次是 ${c.mode}：部署方式不同，请在执行计划中确认切换后再部署"
+ exit 22`}
+fi
 ${c.mode === 'node' ? `port_file="$root/.deployx-port"; [ -f "$port_file" ] || port_file="$root/.launchpad-port"
 if [ -f "$port_file" ]; then test "$(cat "$port_file")" = ${q(site.port)} || { echo '已有站点的端口发生变化，请使用原端口'; exit 23; }; elif [ -n "$(ss -H -ltn 'sport = :${site.port}')" ]; then echo '端口 ${site.port} 已占用'; exit 24; fi` : ''}
 if [ -e "$config" ] && [ ! -f "$root/.deployx-owned" ] && [ ! -f "$root/.launchpad-owned" ]; then echo 'Nginx 配置冲突'; exit 25; fi
@@ -109,11 +145,17 @@ chmod 600 "$target/.env"
 previous=$(readlink "$root/current" || true)
 rollback() {
  code=$?
+ if [ "$code" -ne 0 ] && [ "$committed" -eq 0 ] && [ "$switching" -eq 1 ]; then
+  echo '切换部署方式未完成，恢复原来的方式'
+  printf '%s' "$old_mode" > "$root/.deployx-mode"
+  if sudo -n test -f "$config.deployx-bak"; then sudo -n mv -f "$config.deployx-bak" "$config"; fi
+  ${c.mode === 'node' ? `pm2 delete ${q(name)} --silent >/dev/null 2>&1 || true` : ':'}
+ fi
  if [ "$code" -ne 0 ] && [ "$committed" -eq 0 ] && [ -n "$previous" ]; then
   echo '部署未完成，恢复上一个版本'
   ln -s "$previous" "$root/rollback-${release}"
   mv -Tf "$root/rollback-${release}" "$root/current"
-  ${c.mode === 'node' ? `if [ -f "$previous/ecosystem.json" ]; then pm2 delete ${q(name)} --silent >/dev/null 2>&1 || true; pm2 start "$previous/ecosystem.json" --update-env >/dev/null || true; elif [ -f "$previous/ecosystem.cjs" ]; then pm2 startOrReload "$previous/ecosystem.cjs" --update-env >/dev/null || true; fi` : ':'}
+  if [ -f "$previous/ecosystem.json" ]; then pm2 delete ${q(name)} --silent >/dev/null 2>&1 || true; pm2 start "$previous/ecosystem.json" --update-env >/dev/null || true; elif [ -f "$previous/ecosystem.cjs" ]; then pm2 startOrReload "$previous/ecosystem.cjs" --update-env >/dev/null || true; fi
   sudo -n nginx -t && sudo -n systemctl reload nginx || true
  fi
  if [ "$code" -ne 0 ] && [ "$new_config" -eq 1 ] && [ -z "$previous" ]; then echo '首次部署未完成，保留现场，请从失败日志修复后重试'; fi
@@ -133,12 +175,18 @@ if [ ! -e "$config" ]; then
  printf '%s' ${q(b64(nginx))} | base64 -d | sudo -n tee "$config" >/dev/null
  sudo -n ln -s "$config" ${q(`/etc/nginx/sites-enabled/${name}`)}
  new_config=1
+elif [ "$switching" -eq 1 ]; then
+ sudo -n cp -f "$config" "$config.deployx-bak"
+ printf '%s' ${q(b64(nginx))} | base64 -d | sudo -n tee "$config" >/dev/null
+ [ -e ${q(`/etc/nginx/sites-enabled/${name}`)} ] || sudo -n ln -s "$config" ${q(`/etc/nginx/sites-enabled/${name}`)}
 fi
 sudo -n nginx -t
 sudo -n systemctl reload nginx
 ${c.https ? `sudo -n certbot --nginx -d ${q(site.domain)} --email ${q(c.email)} --agree-tos --no-eff-email --redirect --non-interactive --keep-until-expiring` : ''}
-${c.mode === 'node' ? 'pm2 save >/dev/null' : ''}
+${c.mode === 'node' ? 'pm2 save >/dev/null' : `if [ "$switching" -eq 1 ] && command -v pm2 >/dev/null 2>&1; then pm2 delete ${q(name)} --silent >/dev/null 2>&1 || true; pm2 save >/dev/null 2>&1 || true; fi
+if [ "$switching" -eq 1 ]; then rm -f "$root/.deployx-port" "$root/.launchpad-port"; fi`}
 committed=1
+if [ "$switching" -eq 1 ]; then sudo -n rm -f "$config.deployx-bak"; rm -f "$root/.launchpad-mode"; fi
 if [ -n "$previous" ]; then printf '%s' "$previous" > "$root/previous-release"; fi
 rm -f ${q(archive)}
 echo 'DEPLOYMENT_COMPLETE'
@@ -196,9 +244,27 @@ export async function deploySite(c, site, credentials, job, dataDir) {
       }
     }
     await run('tar', ['-czf', archive, '-C', stage, '.'], {}, log)
-    phase('上传'); client = await connect(credentials)
+    phase('上传')
     const remoteArchive = `/tmp/deployx-${release}.tar.gz`
-    await upload(client, archive, remoteArchive)
+    const size = (await stat(archive)).size
+    for (let attempt = 1; ; attempt++) {
+      try {
+        log(`正在连接服务器…${attempt > 1 ? `（第 ${attempt} 次尝试）` : ''}\n`)
+        client = await connect(credentials)
+        log(`已连接，开始上传 ${(size / 1048576).toFixed(1)} MB\n`)
+        let lastPct = -1
+        await upload(client, archive, remoteArchive, (sent, total) => {
+          const pct = Math.floor(sent / total * 10) * 10
+          if (pct > lastPct) { lastPct = pct; log(`上传进度 ${pct}%\n`) }
+        })
+        break
+      } catch (e) {
+        client?.end(); client = null
+        if (attempt >= UPLOAD_ATTEMPTS || !/中断|卡住|ECONNRESET|before handshake|timeout|Timed out/i.test(`${e.message} ${e.raw || ''}`)) throw e
+        log(`上传失败：${e.message}，${attempt * 5} 秒后自动重试\n`)
+        await new Promise(r => setTimeout(r, attempt * 5000))
+      }
+    }
     phase('发布')
     const scriptFile = path.join(stage, 'deploy.sh')
     await writeFile(scriptFile, remoteScript(c, site, release, remoteArchive, env))

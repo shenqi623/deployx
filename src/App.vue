@@ -5,7 +5,9 @@ type Site = { seq: string; domain: string; siteKey: string; port: number | null;
 type ErrorDetail = { title: string; reasons: string[]; steps: string[]; raw: string }
 type Result = { domain: string; siteKey: string; port: number | null; status: string; error?: string; detail?: ErrorDetail }
 type Job = { id: string; createdAt: string; status: string; phase: string; total: number; current: string; results: Result[]; logs: {time:string;text:string}[]; stopRequested?: boolean; sheetStatus?: string }
-type Plan = { id: string; sites: Site[]; steps: string[]; notes: string[]; mode: string; baseDir: string; validation: string; https: boolean }
+type PreviousDeploy = { status: 'new' | 'managed' | 'foreign' | 'nginx-elsewhere'; mode?: string; port?: number | null; deployedAt?: string | null; target?: string }
+type PlanSite = Site & { previous?: PreviousDeploy; modeChange?: boolean }
+type Plan = { id: string; sites: PlanSite[]; modeChanges: string[]; steps: string[]; notes: string[]; mode: string; baseDir: string; validation: string; https: boolean }
 type Project = { name: string; framework: string; label?: string; mode: string; output: string; entry: string; spa: boolean; scripts: string[]; envKeys: string[]; adapter: boolean; requireSiteKey?: boolean; buildScript?: string; detection?: string; nextSsr?: boolean; nuxtSsr?: boolean; outputMode?: string; runtimeInstall?: boolean; runner?: string }
 type RequirementItem = { id: string; label: string; ok: boolean; required: boolean; detail?: string }
 type Requirements = { osFamily: string; distroId: string; hasSudo: boolean; missing: string[]; canBootstrap: boolean; ready: boolean; items: RequirementItem[] }
@@ -203,7 +205,25 @@ const requirements = ref<Requirements | null>(null), bootstrapLog = ref('')
 const importMode = ref('manual'), csv = ref(''), csvFileName = ref(''), range = reactive({from:1,to:50})
 const csvFileInput = ref<HTMLInputElement | null>(null)
 const newSite = reactive({domain:'',siteKey:'',port:null as number|null})
-const acknowledge = ref(false), customPaths = ref('/\n/sitemap.xml')
+const acknowledge = ref(false), confirmSwitch = ref(false), customPaths = ref('/\n/sitemap.xml')
+const modeName = (m?: string) => m === 'node' ? '动态（Node）' : m === 'static' ? '静态' : '未知方式'
+function previousLabel(p?: PreviousDeploy) {
+  if (!p || p.status === 'new') return '首次部署'
+  if (p.status === 'foreign') return '目录已存在，但不是 DeployX 创建的'
+  if (p.status === 'nginx-elsewhere') return `Nginx 已有此域名配置（${p.target || '指向其他目录'}）`
+  const parts = [`已部署 · ${modeName(p.mode)}`]
+  if (p.port) parts.push(`端口 ${p.port}`)
+  if (p.deployedAt) parts.push(new Date(p.deployedAt).toLocaleString())
+  return parts.join(' · ')
+}
+const switchSites = computed(() => plan.value?.sites.filter(s => s.modeChange) || [])
+const blockedSites = computed(() => plan.value?.sites.filter(s => s.previous?.status === 'foreign' || s.previous?.status === 'nginx-elsewhere') || [])
+const canStart = computed(() => !!plan.value && acknowledge.value && (!switchSites.value.length || confirmSwitch.value))
+function removeFromDeploy(domains: string[]) {
+  const set = new Set(domains)
+  config.sites.forEach(s => { if (set.has(s.domain)) s.selected = false })
+  notice.value = `已从本次部署中移除 ${domains.length} 个站点，请重新生成执行计划。`
+}
 const selected = computed(()=>config.sites.filter(s=>s.selected))
 const successful = computed(()=>job.value?.results.filter(r=>r.status==='deployed').length || 0)
 const failed = computed(()=>job.value?.results.filter(r=>r.status==='failed').length || 0)
@@ -611,8 +631,8 @@ async function decodeCsvFile(file:File){
   return utf8
 }
 function selectRange(){config.sites.forEach(s=>s.selected=Number(s.seq)>=range.from&&Number(s.seq)<=range.to)}
-async function preview(){await action('生成执行计划',async()=>{config.checkPaths=customPaths.value.split('\n').map(x=>x.trim()).filter(Boolean);await new Promise(r=>setTimeout(r,0));const result=await api<Plan>('/plans',config);config.sites.forEach(s=>{const assigned=result.sites.find(r=>r.domain===s.domain);if(assigned)s.port=assigned.port});await nextTick();plan.value=result;step.value=4;acknowledge.value=false})}
-async function start(){await action('开始部署',async()=>{if(!plan.value||!acknowledge.value)return;const r=await api<{id:string}>('/jobs',{planId:plan.value.id});job.value=await api<Job>(`/jobs/${r.id}`);step.value=5;plan.value=null})}
+async function preview(){await action('生成执行计划',async()=>{config.checkPaths=customPaths.value.split('\n').map(x=>x.trim()).filter(Boolean);await new Promise(r=>setTimeout(r,0));const result=await api<Plan>('/plans',config);config.sites.forEach(s=>{const assigned=result.sites.find(r=>r.domain===s.domain);if(assigned)s.port=assigned.port});await nextTick();plan.value=result;step.value=4;acknowledge.value=false;confirmSwitch.value=false})}
+async function start(){await action('开始部署',async()=>{if(!plan.value||!canStart.value)return;const r=await api<{id:string}>('/jobs',{planId:plan.value.id,confirmModeSwitch:confirmSwitch.value?plan.value.modeChanges:[]});job.value=await api<Job>(`/jobs/${r.id}`);step.value=5;plan.value=null})}
 async function stop(){if(job.value)await action('请求停止',async()=>{await api(`/jobs/${job.value!.id}/stop`,{});job.value!.stopRequested=true})}
 async function openJob(id:string){await action('读取任务',async()=>{job.value=await api<Job>(`/jobs/${id}`);step.value=5})}
 async function clearHistory(){
@@ -765,7 +785,20 @@ onUnmounted(()=>{
           </div>
           <div v-if="step===4" class="card-body">
             <div v-if="!plan" class="plan-empty"><div class="large-symbol">◎</div><h3>先生成计划，确认无误再上线。</h3><p>这一步<strong>只会检查配置</strong>，不会构建，也不会改服务器上的任何东西。</p><button class="button primary" :disabled="!!busy" @click="preview">{{busy==='生成执行计划'?'正在检查…':'生成执行计划 →'}}</button></div>
-            <template v-else><div class="plan-stats"><div><strong>{{plan.sites.length}}</strong><span>待部署站点</span></div><div><strong>{{plan.https?'HTTPS':'HTTP'}}</strong><span>访问协议</span></div><div><strong>{{plan.mode==='node'?'动态 · Node':'静态 · Nginx'}}</strong><span>运行方式</span></div></div><div class="pipeline"><span v-for="(s,i) in plan.steps" :key="s"><i>{{i+1}}</i>{{s}}</span></div><div class="site-table"><table><thead><tr><th>域名</th><th>内部端口</th><th>服务器目录</th></tr></thead><tbody><tr v-for="s in plan.sites" :key="s.domain"><td>{{s.domain}}</td><td>{{s.port||'静态（无端口）'}}</td><td class="mono">{{plan.baseDir}}/{{s.domain.replaceAll('.','-')}}</td></tr></tbody></table></div><div class="tip"><span>i</span><div><p v-for="n in plan.notes" :key="n">{{n}}</p><p v-if="plan.https">开始部署即表示同意为这些域名申请证书，并接受 <a href="https://letsencrypt.org/repository/" target="_blank" rel="noopener">Let's Encrypt 服务条款</a>。</p></div></div><label class="check-row"><input v-model="acknowledge" type="checkbox"/><span>我已确认服务器、域名范围和设置，可以开始真正部署。</span></label><button class="button primary full" :disabled="!acknowledge||!!busy||job?.status==='running'" @click="start">开始部署 {{plan.sites.length}} 个站点 ↗</button></template>
+            <template v-else><div class="plan-stats"><div><strong>{{plan.sites.length}}</strong><span>待部署站点</span></div><div><strong>{{plan.https?'HTTPS':'HTTP'}}</strong><span>访问协议</span></div><div><strong>{{plan.mode==='node'?'动态 · Node':'静态 · Nginx'}}</strong><span>运行方式</span></div></div><div class="pipeline"><span v-for="(s,i) in plan.steps" :key="s"><i>{{i+1}}</i>{{s}}</span></div><div class="site-table"><table><thead><tr><th>域名</th><th>之前的部署</th><th>本次</th><th>服务器目录</th></tr></thead><tbody><tr v-for="s in plan.sites" :key="s.domain" :class="{'row-warn':s.modeChange||blockedSites.includes(s)}"><td>{{s.domain}}</td><td>{{previousLabel(s.previous)}}</td><td><span v-if="s.modeChange" class="switch-badge">{{modeName(s.previous?.mode)}} → {{modeName(plan.mode)}}</span><template v-else>{{modeName(plan.mode)}}<template v-if="s.port"> · 端口 {{s.port}}</template></template></td><td class="mono">{{plan.baseDir}}/{{s.domain.replaceAll('.','-')}}</td></tr></tbody></table></div>
+            <div v-if="switchSites.length" class="decision-box">
+              <strong>⚠ {{switchSites.length}} 个站点的部署方式和上次不同，需要你决定</strong>
+              <ul><li v-for="s in switchSites" :key="s.domain"><b>{{s.domain}}</b>：之前是 {{modeName(s.previous?.mode)}}<template v-if="s.previous?.port">（端口 {{s.previous.port}}）</template>，本次是 {{modeName(plan.mode)}}</li></ul>
+              <p>如果切换，DeployX 会：<template v-if="plan.mode==='static'">停止这些站点原来的 PM2 进程、释放原端口，</template><template v-else>为这些站点启动 PM2 进程，</template>并把 Nginx 配置改写为{{plan.mode==='static'?'直接托管静态文件':'反向代理到新端口'}}。{{plan.https?'HTTPS 证书会自动重新配置。':'本次没有开启 HTTPS，切换后这些站点将只能用 http 访问。'}}切换过程中出错会自动恢复原来的方式。</p>
+              <p>如果这不是你想要的，可能是第一步的项目或运行方式选错了，请返回检查。</p>
+              <label class="check-row"><input v-model="confirmSwitch" type="checkbox"/><span>我确认把以上 {{switchSites.length}} 个站点切换为{{modeName(plan.mode)}}部署</span></label>
+              <button class="button small secondary" type="button" @click="removeFromDeploy(switchSites.map(s=>s.domain))">不切换，把这些站点从本次部署中移除</button>
+            </div>
+            <div v-if="blockedSites.length" class="decision-box">
+              <strong>⚠ {{blockedSites.length}} 个站点部署时会被拒绝</strong>
+              <ul><li v-for="s in blockedSites" :key="s.domain"><b>{{s.domain}}</b>：<template v-if="s.previous?.status==='foreign'">服务器上已有同名目录，但不是 DeployX 创建的。为了不覆盖你原来的站点，部署会被拒绝。</template><template v-else>这个域名已在 Nginx 中配置（{{s.previous?.target}}），可能是用其他部署根目录部署过。请把「部署根目录」改回原来的目录后再部署。</template></li></ul>
+              <button class="button small secondary" type="button" @click="removeFromDeploy(blockedSites.map(s=>s.domain))">把这些站点从本次部署中移除</button>
+            </div><div class="tip"><span>i</span><div><p v-for="n in plan.notes" :key="n">{{n}}</p><p v-if="plan.https">开始部署即表示同意为这些域名申请证书，并接受 <a href="https://letsencrypt.org/repository/" target="_blank" rel="noopener">Let's Encrypt 服务条款</a>。</p></div></div><label class="check-row"><input v-model="acknowledge" type="checkbox"/><span>我已确认服务器、域名范围和设置，可以开始真正部署。</span></label><p v-if="acknowledge && switchSites.length && !confirmSwitch" class="field-help">还有部署方式变化的站点没有处理：请确认切换，或把它们从本次部署中移除。</p><button class="button primary full" :disabled="!canStart||!!busy||job?.status==='running'" @click="start">开始部署 {{plan.sites.length}} 个站点 ↗</button></template>
           </div>
           <div v-if="step===5" class="card-body">
             <template v-if="job"><div class="job-heading"><div><span :class="['tag',job.status==='complete'?'green':'']">{{statusLabel(job.status)}}</span><h3>{{job.current||'部署任务'}}</h3><p>{{job.phase}} · 已处理 {{job.results.length}} / {{job.total}} 个站点<span v-if="lastLogAt"> · 最近日志 {{lastLogAt}}</span></p></div><strong class="progress-number">{{progressHeadline}}<small v-if="showProgressPercent">%</small></strong></div><div class="progress-track"><div :style="{width:(job.status==='running' && !job.results.length ? 8 : progress)+'%'}"></div></div><div class="job-summary"><span><i class="dot green-dot"></i>{{successful}} 成功</span><span><i class="dot red-dot"></i>{{failed}} 失败</span><span>{{job.total-job.results.length}} 还在排队</span></div><div class="job-buttons"><button v-if="job.status==='running'" class="button secondary" :disabled="job.stopRequested||!!busy" @click="stop">{{job.stopRequested?'将在当前站完成后停止':'完成当前站后停止'}}</button><button v-if="failed&&job.status!=='running'" class="button secondary" @click="retryFailed">只重试失败的站点</button><button class="button secondary" @click="exportResults">导出结果 CSV</button><button class="text-button" @click="download('部署日志.txt',job!.logs.map(l=>l.time+' '+l.text).join('\n'))">下载日志</button></div><div class="terminal"><div class="terminal-bar"><span>● ● ●</span><b>部署日志</b><small>{{job.status==='running'?'进行中':'已结束'}}</small></div><div class="terminal-content" aria-live="polite"><p v-for="(l,i) in job.logs.slice(-100)" :key="i"><time>{{l.time.slice(11,19)}}</time><span>{{l.text}}</span></p><p v-if="!job.logs.length">正在准备任务…</p></div></div><div v-if="job.sheetStatus" class="tip">{{job.sheetStatus}}</div><div class="result-list"><div v-for="r in job.results" :key="r.domain"><span :class="['result-icon',r.status]">{{r.status==='deployed'?'✓':'!'}}</span><strong>{{r.domain}}</strong><span>{{r.status==='deployed'?(r.port||'静态'):'未完成'}}</span><small>{{r.error||'本站步骤已完成'}}</small><div v-if="r.detail && (r.detail.reasons.length || r.detail.steps.length)" class="result-detail"><template v-if="r.detail.reasons.length"><h4>可能原因</h4><ul><li v-for="x in r.detail.reasons" :key="x">{{x}}</li></ul></template><template v-if="r.detail.steps.length"><h4>怎么解决</h4><ol><li v-for="x in r.detail.steps" :key="x">{{x}}</li></ol></template></div></div></div></template>

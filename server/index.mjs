@@ -7,7 +7,7 @@ import { applySystemProxy } from './proxy.mjs'
 import { assert, inspectProject, parseCsv, sitesFromRows, validateConfig, redact, assertDeployShape } from './core.mjs'
 import { connect, remote } from './ssh.mjs'
 import { explainError, formatExplanation } from './errors.mjs'
-import { deploySite } from './deploy.mjs'
+import { deploySite, siteProbe, parseSiteProbe } from './deploy.mjs'
 import { loadSheet, writePorts } from './sheets.mjs'
 import { PROBE_COMMAND, buildInstallScript, parseReport, requirementsFromReport } from './bootstrap.mjs'
 
@@ -157,27 +157,36 @@ const server = http.createServer(async (req, res) => {
         const client = await connect(connection.credentials)
         let live
         try {
-          live = await remote(client, 'ss -H -ltn; ' + c.sites.map(s => `p='${c.baseDir}/${s.slug}/.deployx-port'; [ -f "$p" ] || p='${c.baseDir}/${s.slug}/.launchpad-port'; if [ -f "$p" ]; then printf 'DX_PORT ${s.domain} '; cat "$p"; printf '\\n'; fi`).join('; '), () => {}, 30000)
+          live = await remote(client, 'ss -H -ltn; ' + c.sites.map(s => siteProbe(c.baseDir, s)).join('; '), () => {}, 60000)
         } finally { client.end() }
         const occupied = [...live.matchAll(/(?:\]|[\d.*]):(\d+)\s/g)].map(m=>Number(m[1]))
-        const existing = new Map([...live.matchAll(/^(?:DX|LP)_PORT (\S+) (\d+)$/gm)].map(m=>[m[1],Number(m[2])]))
+        const previous = parseSiteProbe(live)
+        const existingPort = domain => previous.get(domain)?.mode === 'node' ? previous.get(domain).port : null
         const nextInput = structuredClone(b)
-        nextInput.sites = nextInput.sites.map(s=>({...s,port:s.port||existing.get(s.domain)||null}))
+        nextInput.sites = nextInput.sites.map(s=>({...s,port:s.port||existingPort(s.domain)||null}))
         c = validateConfig(nextInput,occupied)
         assertDeployShape(c, project)
-        for(const s of c.sites) if(c.mode==='node' && occupied.includes(s.port)) assert(existing.get(s.domain)===s.port, `${s.domain} 指定的端口 ${s.port} 已被其他服务占用`)
-        const id = randomUUID(); plans.set(id,{ config:c, expires:Date.now()+10*60000 })
-        return json(res,200,{id,sites:c.sites, framework:c.framework,mode:c.mode,baseDir:c.baseDir,https:c.https,validation:c.validation,steps:['本机构建','上传独立版本','切换版本 / PM2','Nginx 配置',...(c.https?['申请 HTTPS 证书']:[]),...(c.validation!=='minimal'?['可选验证']:[]),...(c.syncSheet?['回填 Port']:[])], notes:[project.detection || `${project.label} · ${c.mode}`,'首次部署会创建独立站点目录；已有非本工具管理的目录将拒绝覆盖。','请确保域名已解析到目标服务器，且 80/443 端口可访问。',...(c.runtimeInstall?['运行时依赖仅安装 production，默认不执行安装脚本。']:[])]})
+        for(const s of c.sites) if(c.mode==='node' && occupied.includes(s.port)) assert(existingPort(s.domain)===s.port, `${s.domain} 指定的端口 ${s.port} 已被其他服务占用`)
+        const sites = c.sites.map(s => {
+          const prev = previous.get(s.domain) || { status: 'new' }
+          return { ...s, previous: prev, modeChange: prev.status === 'managed' && ['static','node'].includes(prev.mode) && prev.mode !== c.mode }
+        })
+        const modeChanges = sites.filter(s => s.modeChange).map(s => s.domain)
+        const id = randomUUID(); plans.set(id,{ config:c, modeChanges, expires:Date.now()+10*60000 })
+        return json(res,200,{id,sites,modeChanges,framework:c.framework,mode:c.mode,baseDir:c.baseDir,https:c.https,validation:c.validation,steps:['本机构建','上传独立版本','切换版本 / PM2','Nginx 配置',...(c.https?['申请 HTTPS 证书']:[]),...(c.validation!=='minimal'?['可选验证']:[]),...(c.syncSheet?['回填 Port']:[])], notes:[project.detection || `${project.label} · ${c.mode}`,'首次部署会创建独立站点目录；已有非本工具管理的目录将拒绝覆盖。','请确保域名已解析到目标服务器，且 80/443 端口可访问。',...(c.runtimeInstall?['运行时依赖仅安装 production，默认不执行安装脚本。']:[])]})
       }
       if (url.pathname === '/api/jobs' && req.method === 'POST') {
         assert(!activeJob, '已有任务运行中，请等待完成')
         const plan = plans.get(b.planId); assert(plan && plan.expires > Date.now(), '执行计划已过期，请重新生成')
-        const c = plan.config, connection = getConnection(c.connectionId)
+        const confirmed = new Set(Array.isArray(b.confirmModeSwitch) ? b.confirmModeSwitch : [])
+        const unconfirmed = plan.modeChanges.filter(d => !confirmed.has(d))
+        assert(!unconfirmed.length, `以下站点的部署方式和上次不同，需要先在执行计划中确认切换：${unconfirmed.join('、')}`)
+        const c = { ...plan.config, allowModeSwitch: plan.modeChanges }, connection = getConnection(c.connectionId)
         const source = c.sourceId ? sources.get(c.sourceId) : null
         assert(!c.syncSheet || source, 'Google 表格连接已失效，请重新导入')
         plans.delete(b.planId)
         const j = {id:randomUUID(),createdAt:new Date().toISOString(),status:'running',phase:'准备',total:c.sites.length,current:'',results:[],logs:[],stopRequested:false,sheetStatus:''}
-        j.log = text => { j.logs.push({time:new Date().toISOString(),text:String(text).slice(-6000)}); if(j.logs.length>800)j.logs.shift() }
+        j.log = text => { j.logs.push({time:new Date().toISOString(),text:String(text).replace(/\x1b\[[0-9;?]*[A-Za-z]/g,'').slice(-6000)}); if(j.logs.length>800)j.logs.shift() }
         jobs.set(j.id,j); activeJob=j.id
         execute(j,c,connection.credentials,source).catch(()=>{})
         return json(res,202,{id:j.id})

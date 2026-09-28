@@ -74,6 +74,13 @@
 .error-panel-actions{display:flex;justify-content:flex-end;gap:8px}
 .result-detail{flex-basis:100%;margin-left:28px;padding:8px 12px 10px;background:#fff7f2;border:1px solid #f1dfd4;border-radius:8px}
 .result-detail h4:first-child{margin-top:0}
+.row-warn td{background:#fff8ec}
+.switch-badge{display:inline-block;padding:2px 8px;border-radius:5px;background:#fdebd3;color:#9a5a1c;font-size:10px;font-weight:600;white-space:nowrap}
+.decision-box{margin:16px 0;padding:14px 16px;border:1px solid #efd9b4;border-left:4px solid #e0a34f;border-radius:9px;background:#fffaf0;color:#6b5330;font-size:12px}
+.decision-box>strong{display:block;font-size:13px;color:#8a5a1a;margin-bottom:6px}
+.decision-box ul{margin:4px 0 8px;padding-left:18px;line-height:1.8}
+.decision-box p{color:#7a6444;font-size:11px;line-height:1.8;margin:4px 0}
+.decision-box .check-row{margin:10px 0 8px;color:#6b5330}
 .flash-fade-enter-active,.flash-fade-leave-active{
   transition:opacity .5s ease, transform .5s ease;
 }
